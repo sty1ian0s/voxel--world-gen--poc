@@ -126,6 +126,13 @@ impl PackedVoxel {
         Self::new(block, LightLevel::DARK, LightLevel::DARK)
     }
 
+    /// Rebuilds a voxel from its raw bits. Every `u16` is a valid voxel, so
+    /// this cannot fail; it exists for the mesher's mask round trip.
+    #[inline]
+    pub const fn from_raw(raw: u16) -> Self {
+        Self(raw)
+    }
+
     #[inline]
     pub const fn raw(self) -> u16 {
         self.0
