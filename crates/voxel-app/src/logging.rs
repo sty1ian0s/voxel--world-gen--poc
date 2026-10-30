@@ -6,7 +6,14 @@
 //! until the streaming stage actually needs spans.
 
 pub fn init(env: voxel_core::Env) {
-    let default = if env.is_dev() { "debug" } else { "warn" };
+    // Scoped to this workspace's crates rather than a bare level, so a dev run
+    // is not drowned in wgpu, naga and windowing-backend internals. Set
+    // `RUST_LOG=debug` by hand when those are what you are chasing.
+    let default = if env.is_dev() {
+        "voxel_core=debug,voxel_app=debug"
+    } else {
+        "warn"
+    };
 
     env_logger::Builder::from_env(
         // `RUST_LOG` from .env/.env.local wins; `default` is the fallback.

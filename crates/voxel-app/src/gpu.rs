@@ -68,6 +68,35 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color, 1.0);
 }
+
+// Wireframe entry points.
+//
+// Identical to the solid path except for the depth nudge. A hardware depth
+// bias would be the normal way to stop an outline z-fighting with the face it
+// belongs to, but wgpu rejects a depth bias on a non-triangle topology, so the
+// equivalent is done here: after perspective divide, pulling clip-space z
+// toward the near plane by a fixed fraction of its range moves the line in
+// front of the surface without moving it in screen space.
+const WIRE_DEPTH_NUDGE: f32 = 0.00008;
+
+@vertex
+fn vs_wire(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let world = vec4<f32>(in.position + chunk.origin.xyz, 1.0);
+    var clip = camera.view_projection * world;
+    // Only meaningful for w > 0, which is everything actually on screen.
+    if (clip.w > 0.0) {
+        clip.z -= WIRE_DEPTH_NUDGE * clip.w;
+    }
+    out.clip_position = clip;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_wire(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 1.0);
+}
 "#;
 
 /// Overlay shader: axis-aligned textured quads in clip space.
@@ -958,13 +987,13 @@ impl Renderer {
                     layout: Some(&layout),
                     vertex: wgpu::VertexState {
                         module: &shader,
-                        entry_point: Some("vs_main"),
+                        entry_point: Some("vs_wire"),
                         buffers: &[Some(Vertex::LAYOUT)],
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
-                        entry_point: Some("fs_main"),
+                        entry_point: Some("fs_wire"),
                         targets: &[Some(wgpu::ColorTargetState {
                             format: self.config.format,
                             blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -985,18 +1014,15 @@ impl Renderer {
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
                         format: DEPTH_FORMAT,
-                        // Depth-tested so hidden edges stay hidden, but with a
-                        // bias pulling the lines toward the camera: without it
-                        // the outline z-fights with the face it belongs to and
-                        // dashes in and out.
+                        // Depth-tested so hidden edges stay hidden. The bias
+                        // that stops the outline z-fighting with its own face
+                        // is applied in the shader instead: wgpu rejects a
+                        // pipeline that sets a depth bias with a non-triangle
+                        // topology, which `LineList` is.
                         depth_write_enabled: Some(false),
                         depth_compare: Some(wgpu::CompareFunction::LessEqual),
                         stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState {
-                            constant: -2,
-                            slope_scale: -2.0,
-                            clamp: 0.0,
-                        },
+                        bias: wgpu::DepthBiasState::default(),
                     }),
                     multisample: wgpu::MultisampleState::default(),
                     multiview_mask: None,
@@ -1391,6 +1417,45 @@ mod tests {
         let names: Vec<&str> = module.entry_points.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"vs_main"), "missing vertex entry: {names:?}");
         assert!(names.contains(&"fs_main"), "missing fragment entry: {names:?}");
+    }
+
+    #[test]
+    fn the_wire_pipeline_uses_no_depth_bias() {
+        // wgpu rejects a depth bias with a non-triangle topology, and the
+        // wireframe is a LineList. This is asserted here because the failure is
+        // a runtime validation panic when the pipeline is first built, which
+        // only happens when the mesh view is switched on - so a build-only or
+        // unit test run would never see it. It cost a working demo to find.
+        //
+        // The bias is emulated in `vs_wire` instead; the constant is asserted
+        // non-zero so removing it cannot silently reintroduce z-fighting.
+        assert!(
+            SHADER.contains("WIRE_DEPTH_NUDGE") && SHADER.contains("vs_wire"),
+            "the shader must carry the wireframe depth nudge"
+        );
+        // And the bias value must be non-zero, or the nudge does nothing.
+        let nudge = SHADER
+            .lines()
+            .find(|l| l.contains("const WIRE_DEPTH_NUDGE"))
+            .expect("nudge constant");
+        assert!(
+            !nudge.contains("0.0;"),
+            "a zero nudge would z-fight: {nudge}"
+        );
+    }
+
+    #[test]
+    fn the_wire_entry_points_are_distinct_from_the_solid_ones() {
+        // If the wireframe reused `vs_main` it would lose the depth nudge and
+        // z-fight; if the solid path used `vs_wire` the terrain would be pulled
+        // toward the camera and occlude everything.
+        assert!(SHADER.contains("fn vs_wire"));
+        assert!(SHADER.contains("fn fs_wire"));
+        let module = naga::front::wgsl::parse_str(SHADER).expect("shader parses");
+        let names: Vec<&str> = module.entry_points.iter().map(|e| e.name.as_str()).collect();
+        for expected in ["vs_main", "fs_main", "vs_wire", "fs_wire"] {
+            assert!(names.contains(&expected), "missing entry point {expected}");
+        }
     }
 
     #[test]
