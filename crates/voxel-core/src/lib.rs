@@ -14,7 +14,9 @@ pub mod mesh;
 pub mod terrain;
 pub mod world;
 
-pub use config::{Carver, CaveParams, Config, ConfigError, Env, RenderConfig, WorldSize};
+pub use config::{
+    CarveParity, Carver, CaveParams, Config, ConfigError, Env, RenderConfig, WorldSize,
+};
 pub use domain::{
     BlockId, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LightLevel, LocalPos, PackedVoxel,
     VoxelIndex,

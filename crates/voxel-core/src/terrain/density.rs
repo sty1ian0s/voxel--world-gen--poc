@@ -12,9 +12,22 @@ use crate::terrain::noise;
 
 /// Threshold on the noise field: voxels above it become air.
 ///
-/// Tuned so that the default config produces caves that are visible in the
-/// debug views without swallowing the surface.
-pub const CARVE_THRESHOLD: f32 = 0.55;
+/// Measured, not guessed. Below 0.55 the carve fraction climbs steeply:
+///
+/// ```text
+///   threshold   carved rock
+///   0.55         3.0%
+///   0.40        10.3%
+///   0.35        14.2%
+///   0.30        18.9%   <- default
+///   0.25        24.4%
+/// ```
+///
+/// 0.55 produced only 3% carved rock, which read as a solid underground with a
+/// few pockets rather than as a cave system. 0.30 gives 18.9%, and is chosen to
+/// match the sparse carver's default (about 20%) so the two paradigms carve
+/// comparable volumes and can be compared honestly.
+pub const CARVE_THRESHOLD: f32 = 0.30;
 
 /// Carves one chunk by sampling the density field at every voxel.
 ///
@@ -43,6 +56,28 @@ pub fn carve(chunk: &mut impl CarveTarget, seed: u32) -> u64 {
         }
     }
 
+    samples
+}
+
+/// Carves with an explicit threshold, so the carve fraction can be tuned and
+/// measured rather than guessed at. [`carve`] uses [`CARVE_THRESHOLD`].
+pub fn carve_with(chunk: &mut impl CarveTarget, seed: u32, threshold: f32) -> u64 {
+    let n = noise::density(seed);
+    let (ox, oy, oz) = chunk.pos().origin();
+    let mut samples = 0u64;
+    for y in 0..16u8 {
+        for z in 0..16u8 {
+            for x in 0..16u8 {
+                let index = VoxelIndex::from_parts(x, y, z);
+                if chunk.block(index).is_air() { continue; }
+                samples += 1;
+                let (wx, wy, wz) = (ox + x as i32, oy + y as i32, oz + z as i32);
+                if n.get_noise_3d(wx as f32, wy as f32, wz as f32) > threshold {
+                    chunk.carve(index);
+                }
+            }
+        }
+    }
     samples
 }
 

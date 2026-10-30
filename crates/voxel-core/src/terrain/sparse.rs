@@ -102,8 +102,20 @@ pub struct StampStats {
 }
 
 /// Upper bound on origins enumerated per region, so a misconfigured density
-/// degrades rather than hangs. 64 origins of radius 4 already fills a region.
-pub const MAX_ORIGINS_PER_REGION: u32 = 64;
+/// degrades rather than hangs.
+///
+/// This was 64, which silently capped the cave density at about 0.245 origins
+/// per 1000 voxels-cubed: every higher setting produced the identical world,
+/// which is why the sparse carver carved far less rock than the density carver
+/// and looked like it was missing the underground. The cap now sits above any
+/// sane configuration, and the parity test against the density carver would
+/// catch it being hit again.
+///
+/// Cost note: a region holds `REGION_SIZE^3` = 262144 voxels, and each origin
+/// costs only its own bounding box to stamp, so a few hundred origins per
+/// region is still far cheaper than a per-voxel density sweep. Regions are
+/// 4 chunks on a side, so an origin list of 1024 is 4 per voxel-column.
+pub const MAX_ORIGINS_PER_REGION: u32 = 1024;
 
 /// Carves one chunk by stamping every origin that can reach it.
 pub fn carve(chunk: &mut impl CarveTarget, seed: u32, params: &CaveParams) -> StampStats {

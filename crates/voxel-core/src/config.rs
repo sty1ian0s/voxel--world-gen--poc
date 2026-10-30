@@ -143,12 +143,108 @@ pub struct CaveParams {
     /// origins whose padded AABB can touch the requested chunk, so this number
     /// (not the world volume) is what its cost scales with.
     ///
-    /// Per-1000 rather than per-voxel so the values stay readable: the 0.02
-    /// default is about one cave origin per 50k voxels, i.e. a handful per
-    /// 64-voxel region.
+    /// Per-1000 rather than per-voxel so the values stay readable. The default
+    /// of 2.0 carves about 20% of the rock, deliberately matching the density
+    /// carver's threshold so both approaches produce cave systems of a
+    /// comparable size and the benchmark compares like with like.
     pub origin_density: f32,
     pub min_radius: f32,
     pub max_radius: f32,
+}
+
+/// Measures how much rock each carver removes, so the two can be compared.
+///
+/// Lives here rather than in the benchmark because the HUD and the parity test
+/// both report it, and three copies of the same measurement would drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CarveParity {
+    /// Solid voxels before carving, over the sampled band.
+    pub solid: u64,
+    /// Voxels the density carver turned to air.
+    pub density_carved: u64,
+    /// Voxels the sparse carver turned to air.
+    pub sparse_carved: u64,
+    /// Voxels the density carver sampled, for the `O(N^3)` comparison.
+    pub density_samples: u64,
+    /// Voxels the sparse carver evaluated an SDF against, for the `O(S)` one.
+    pub sparse_voxels_tested: u64,
+}
+
+impl CarveParity {
+    /// Samples both carvers over the same chunk band.
+    ///
+    /// `side` is the band width in chunks; the band spans two chunks vertically
+    /// so the measurement covers underground rock rather than one slice.
+    pub fn measure(seed: u32, params: &CaveParams, side: i32) -> Self {
+        use crate::domain::{CHUNK_VOLUME, ChunkPos, VoxelIndex};
+        use crate::terrain::{self, density, heightmap::HeightMap, sparse};
+        use crate::world::Chunk;
+
+        let hm = HeightMap::fitted_to_world(seed, 64);
+        let mut out = Self::default();
+
+        let air = |c: &Chunk| -> u64 {
+            (0..CHUNK_VOLUME as u16)
+                .filter(|&i| {
+                    c.block(unsafe { VoxelIndex::from_raw_unchecked(i) })
+                        .is_air()
+                })
+                .count() as u64
+        };
+
+        for cy in 1..3 {
+            for cx in 0..side {
+                for cz in 0..side {
+                    let pos = ChunkPos::new(cx, cy, cz);
+
+                    let mut base = Chunk::at(pos);
+                    terrain::generate_surface(&mut base, pos, &hm);
+                    let before = air(&base);
+                    out.solid += CHUNK_VOLUME as u64 - before;
+
+                    let mut d = base.clone();
+                    out.density_samples += density::carve(&mut d, seed);
+                    out.density_carved += air(&d) - before;
+
+                    let mut s = base;
+                    let stats = sparse::carve(&mut s, seed, params);
+                    out.sparse_voxels_tested += stats.voxels_tested;
+                    out.sparse_carved += air(&s) - before;
+                }
+            }
+        }
+
+        out
+    }
+
+    fn percent(carved: u64, solid: u64) -> f64 {
+        100.0 * carved as f64 / solid.max(1) as f64
+    }
+
+    pub fn density_percent(&self) -> f64 {
+        Self::percent(self.density_carved, self.solid)
+    }
+
+    pub fn sparse_percent(&self) -> f64 {
+        Self::percent(self.sparse_carved, self.solid)
+    }
+
+    /// Difference in coverage, in percentage points.
+    pub fn divergence(&self) -> f64 {
+        (self.density_percent() - self.sparse_percent()).abs()
+    }
+
+    /// One-line summary for the log or the HUD.
+    pub fn summary(&self) -> String {
+        format!(
+            "carve: density {:.1}% ({} samples) vs sparse {:.1}% ({} tested), divergence {:.1}pp",
+            self.density_percent(),
+            self.density_samples,
+            self.sparse_percent(),
+            self.sparse_voxels_tested,
+            self.divergence()
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -229,7 +325,7 @@ impl Config {
         }
 
         let cave = CaveParams {
-            origin_density: fnum("VOXEL_CAVE_ORIGIN_DENSITY", 0.02)?,
+            origin_density: fnum("VOXEL_CAVE_ORIGIN_DENSITY", 2.0)?,
             min_radius: fnum("VOXEL_CAVE_MIN_RADIUS", 1.5)?,
             max_radius: fnum("VOXEL_CAVE_MAX_RADIUS", 4.0)?,
         };
