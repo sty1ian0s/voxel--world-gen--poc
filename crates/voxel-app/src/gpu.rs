@@ -561,10 +561,22 @@ impl Renderer {
         let mut rects: Vec<([f32; 4], u32, u32)> = Vec::new();
         let mut textures: Vec<crate::font::TextTexture> = Vec::new();
 
+        // Lines that would run past the bottom are dropped rather than drawn
+        // off-screen, where they cannot be read and silently look like a
+        // rendering failure. Benchmark mode is the case that hits this: the
+        // timing block makes the panel taller than a short window.
+        let bottom = self.config.height as f32;
+        let mut dropped = 0usize;
+
         let mut y = margin;
         for line in lines {
             if line.is_empty() {
                 // A blank line still advances, which is what separates groups.
+                y += line_step;
+                continue;
+            }
+            if y + crate::font::GLYPH_H as f32 * scale as f32 > bottom {
+                dropped += 1;
                 y += line_step;
                 continue;
             }
@@ -593,6 +605,12 @@ impl Renderer {
             ));
             textures.push(tex);
             y += line_step;
+        }
+
+        if dropped > 0 {
+            // Reported once per rebuild rather than every frame, since the
+            // rebuild only happens when the text changes.
+            log::debug!("HUD: {dropped} lines did not fit and were not drawn");
         }
 
         if vertices.is_empty() {

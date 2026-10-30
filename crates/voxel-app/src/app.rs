@@ -16,15 +16,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use voxel_core::debug::report;
 use voxel_core::mesh::mesh_chunk;
-use voxel_core::{Carver, ChunkGrid, ChunkPos, Config};
+use voxel_core::{CarveParity, Carver, ChunkPos, Config};
 
 use crate::camera::Camera;
 use crate::gpu::{FrameOutcome, Renderer};
 use crate::hud::{CarverSwitch, HudState};
 use crate::render::ChunkMeshData;
 use crate::stats::FrameTimer;
+use crate::stream::StreamWorld;
 
 /// Sky colour, used as the clear colour and as the ambient against which the
 /// terrain's shading reads.
@@ -39,8 +39,12 @@ const SKY: wgpu::Color = wgpu::Color {
 const MOVE_SPEED: f32 = 40.0;
 /// How far the camera turns per second while a look key is held.
 const LOOK_SPEED: f32 = 1.8;
-/// Chunks beyond this are not drawn.
-const VIEW_RADIUS_CHUNKS: i32 = 24;
+/// Render distance in chunks, as requested for the demo.
+pub const RENDER_DISTANCE: i32 = 16;
+
+/// Chunks are kept this much further out than the render distance, so flying
+/// back and forth across the boundary does not regenerate the same ground.
+const EVICT_RADIUS: i32 = RENDER_DISTANCE + 4;
 
 /// Runs the windowed application until the window closes.
 pub fn run(cfg: Config) -> Result<()> {
@@ -68,6 +72,10 @@ struct App {
     /// Counters used to decide when the HUD text actually changes, so the
     /// overlay is not rebuilt and re-uploaded every single frame.
     last_hud: Option<String>,
+    /// Whether the benchmark readout is shown.
+    benchmark_mode: bool,
+    /// Carve coverage of each approach, measured once at startup.
+    parity: CarveParity,
     /// Wall-clock accumulators for the logging summary.
     frames: u64,
     fps_timer: Instant,
@@ -83,6 +91,13 @@ impl App {
             timer: FrameTimer::new(),
             carver: CarverSwitch::new(cfg.carver),
             last_hud: None,
+            // Off by default: the timing block is for benchmarking, not for
+            // flying around, and it triples the size of the overlay.
+            benchmark_mode: false,
+            // Measured once at startup over a small sample: this is a property
+            // of the configuration, not of the running frame, so recomputing it
+            // every frame would be waste.
+            parity: CarveParity::measure(cfg.seed, &cfg.cave, 2),
             frames: 0,
             fps_timer: Instant::now(),
         }
@@ -96,13 +111,16 @@ struct State {
     camera: Camera,
     uploaded_chunks: usize,
     uploaded_vertices: usize,
-    /// The generated world, kept so a carver switch can regenerate without
-    /// re-reading config.
-    grid: ChunkGrid,
-    /// Chunks the cull flags kept, for the HUD's drawn/total ratio.
-    chunks_total: usize,
+    /// The streamed world, generated around the camera as it moves.
+    world: StreamWorld,
+    /// Chunk the camera was in last frame, so streaming only runs on a boundary
+    /// crossing rather than every frame.
+    last_centre: ChunkPos,
     generation_ms: f32,
     meshing_ms: f32,
+    upload_ms: f32,
+    /// Chunks meshed and uploaded this frame, for the streaming readout.
+    chunks_streamed: usize,
 }
 
 impl ApplicationHandler for App {
@@ -172,31 +190,60 @@ impl ApplicationHandler for App {
             log::warn!("using a software rasteriser; frame timings are not representative");
         }
 
-        // Generate, mesh and upload once at startup.
         let mut renderer = renderer;
-        let camera = default_camera(&self.cfg, &ChunkGrid::new(
-            self.cfg.world.x,
-            self.cfg.world.y,
-            self.cfg.world.z,
-        ));
-        let built = build_world(&mut renderer, &self.cfg);
+        let camera = default_camera(&self.cfg);
+        let mut world = StreamWorld::new(
+            self.cfg.seed,
+            self.cfg.world_height(),
+            self.cfg.cave,
+            self.cfg.carver,
+        );
+
+        // Stream the initial view distance before the first frame, so the world
+        // is already there rather than popping in.
+        let centre = ChunkPos::from_world(
+            camera.eye[0] as i32,
+            camera.eye[1] as i32,
+            camera.eye[2] as i32,
+        );
+        let started = Instant::now();
+        let streamed = world.stream_around(centre, RENDER_DISTANCE);
+        let stream_ms = started.elapsed().as_secs_f32() * 1000.0;
+
+        let t0 = Instant::now();
+        let meshes = mesh_world(&world, centre, RENDER_DISTANCE);
+        let meshing_ms = t0.elapsed().as_secs_f32() * 1000.0;
+
+        let t1 = Instant::now();
+        let vertices: usize = meshes.iter().map(|m| m.vertex_count()).sum();
+        renderer.upload_chunks(&meshes);
+        let upload_ms = t1.elapsed().as_secs_f32() * 1000.0;
 
         log::warn!(
-            "world ready: {} chunks meshed, {} vertices uploaded",
-            built.chunks_drawn, built.vertices
+            "world ready: {} chunks generated in {stream_ms:.0}ms, {} meshed in {meshing_ms:.0}ms, \
+             {} vertices uploaded in {upload_ms:.0}ms",
+            streamed,
+            meshes.len(),
+            vertices,
         );
-        log::warn!("generation: {}", built.report_line);
+        log::info!(
+            "({:.2}ms per chunk to generate; generation is the sparse/density carver plus \
+             the shared surface pass)",
+            world.ms_per_chunk()
+        );
 
         self.state = Some(State {
             window,
             renderer,
             camera,
-            uploaded_chunks: built.chunks_drawn,
-            uploaded_vertices: built.vertices,
-            grid: built.grid,
-            chunks_total: built.chunks_total,
-            generation_ms: built.generation_ms,
-            meshing_ms: built.meshing_ms,
+            uploaded_chunks: meshes.len(),
+            uploaded_vertices: vertices,
+            world,
+            last_centre: centre,
+            generation_ms: stream_ms,
+            meshing_ms,
+            upload_ms,
+            chunks_streamed: streamed,
         });
         self.last_frame = Instant::now();
     }
@@ -251,6 +298,15 @@ impl ApplicationHandler for App {
                             self.carver.toggle();
                             log::info!("carver switch queued");
                         }
+                        // Toggle the generation-timing and carve-coverage block.
+                        KeyCode::KeyB => {
+                            self.benchmark_mode = !self.benchmark_mode;
+                            self.last_hud = None;
+                            log::info!(
+                                "benchmark readout {}",
+                                if self.benchmark_mode { "on" } else { "off" }
+                            );
+                        }
                         // Reset the frame-time window, to measure a specific
                         // moment rather than a lifetime average.
                         KeyCode::KeyR => {
@@ -280,24 +336,83 @@ impl ApplicationHandler for App {
                 if let Some(carver) = self.carver.take() {
                     self.cfg.carver = carver;
                     log::warn!("switching carver to {carver}, regenerating world");
-                    let built = build_world(&mut state.renderer, &self.cfg);
-                    state.grid = built.grid;
-                    state.chunks_total = built.chunks_total;
-                    state.generation_ms = built.generation_ms;
-                    state.meshing_ms = built.meshing_ms;
-                    state.uploaded_chunks = built.chunks_drawn;
-                    state.uploaded_vertices = built.vertices;
+                    let t0 = Instant::now();
+                    state.world.set_carver(carver);
+                    state.world.regenerate_all();
+                    state.generation_ms = t0.elapsed().as_secs_f32() * 1000.0;
+
+                    // Remesh everything, since every chunk changed.
+                    let t1 = Instant::now();
+                    let meshes = mesh_world(&state.world, state.last_centre, RENDER_DISTANCE);
+                    state.meshing_ms = t1.elapsed().as_secs_f32() * 1000.0;
+
+                    let t2 = Instant::now();
+                    state.uploaded_vertices = meshes.iter().map(|m| m.vertex_count()).sum();
+                    state.uploaded_chunks = meshes.len();
+                    state.renderer.upload_chunks(&meshes);
+                    state.upload_ms = t2.elapsed().as_secs_f32() * 1000.0;
+                    state.chunks_streamed = 0;
+
                     // The old world's frame times say nothing about the new
                     // one, so the window starts clean rather than blending the
                     // two carvers together in the percentiles.
                     self.timer.reset();
-                    // The basic requirement for side-by-side comparison is to
-                    // keep looking at the same place, which means the camera
-                    // deliberately survives the switch.
-                    log::warn!("carver {carver}: {}", built.report_line);
+                    // Keeping the camera is the whole point: comparing two
+                    // carvers is only meaningful from the same viewpoint.
+                    log::warn!(
+                        "carver {carver}: {} chunks regenerated in {:.0}ms, meshed in {:.0}ms",
+                        state.world.len(),
+                        state.generation_ms,
+                        state.meshing_ms
+                    );
                 }
 
                 apply_input(state, &self.keys, dt);
+
+                // Stream only when the camera crosses a chunk boundary. Doing
+                // it every frame would re-scan the radius for no reason, and a
+                // boundary crossing is exactly when new ground becomes visible.
+                let centre = ChunkPos::from_world(
+                    state.camera.eye[0] as i32,
+                    state.camera.eye[1] as i32,
+                    state.camera.eye[2] as i32,
+                );
+                if centre != state.last_centre {
+                    state.last_centre = centre;
+
+                    let t0 = Instant::now();
+                    let added = state.world.stream_around(centre, RENDER_DISTANCE);
+                    state.world.evict_beyond(centre, EVICT_RADIUS);
+                    state.generation_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    state.chunks_streamed = added;
+
+                    if added > 0 {
+                        // Remesh and re-upload the whole view distance. Meshing
+                        // only the new chunks would be cheaper, but it needs a
+                        // per-chunk vertex buffer to avoid re-uploading one
+                        // giant buffer, which is a streaming optimisation this
+                        // POC does not need yet.
+                        let t1 = Instant::now();
+                        let meshes = mesh_world(&state.world, centre, RENDER_DISTANCE);
+                        state.meshing_ms = t1.elapsed().as_secs_f32() * 1000.0;
+
+                        let t2 = Instant::now();
+                        state.uploaded_vertices =
+                            meshes.iter().map(|m| m.vertex_count()).sum();
+                        state.uploaded_chunks = meshes.len();
+                        state.renderer.upload_chunks(&meshes);
+                        state.upload_ms = t2.elapsed().as_secs_f32() * 1000.0;
+
+                        log::info!(
+                            "streamed {added} chunks in {:.1}ms, meshed {} in {:.1}ms, \
+                             uploaded in {:.1}ms",
+                            state.generation_ms,
+                            state.uploaded_chunks,
+                            state.meshing_ms,
+                            state.upload_ms
+                        );
+                    }
+                }
 
                 let view_projection = state.camera.view_projection();
                 state.renderer.set_view_projection(view_projection);
@@ -310,6 +425,8 @@ impl ApplicationHandler for App {
                     &mut self.last_hud,
                     self.carver.current(),
                     &self.cfg,
+                    self.benchmark_mode,
+                    self.parity,
                     state,
                 );
 
@@ -355,43 +472,39 @@ impl ApplicationHandler for App {
     }
 }
 
-/// What a completed world build produced.
-struct BuiltWorld {
-    grid: ChunkGrid,
-    chunks_total: usize,
-    chunks_drawn: usize,
-    vertices: usize,
-    generation_ms: f32,
-    meshing_ms: f32,
-    /// The generation counter line, reused for both the log and the HUD.
-    report_line: String,
-}
-
-/// Generates, meshes and uploads a world for the configured carver.
+/// Meshes every drawable chunk within the render distance of `centre`.
 ///
-/// Shared by startup and by the carver switch, so the two paths cannot drift:
-/// whatever the switch does is exactly what startup does.
-fn build_world(renderer: &mut Renderer, cfg: &Config) -> BuiltWorld {
-    let t0 = Instant::now();
-    let (grid, stats) = report::generate_world(cfg);
-    let generation_ms = t0.elapsed().as_secs_f32() * 1000.0;
+/// Only chunks inside the radius are meshed, even though the world keeps a
+/// wider halo in memory: meshing the halo would triple the work for geometry
+/// that is out of view.
+fn mesh_world(
+    world: &StreamWorld,
+    centre: ChunkPos,
+    radius: i32,
+) -> Vec<ChunkMeshData> {
+    use rayon::prelude::*;
 
-    let t1 = Instant::now();
-    let meshes = mesh_grid(&grid, cfg);
-    let meshing_ms = t1.elapsed().as_secs_f32() * 1000.0;
+    let positions: Vec<ChunkPos> = world
+        .positions()
+        .filter(|p| {
+            if p.chebyshev(centre) > radius {
+                return false;
+            }
+            let c = world.get(*p).expect("position came from the world");
+            // The cull flags are why an empty sky chunk costs one bool rather
+            // than a meshing pass.
+            !c.empty && !c.enclosed
+        })
+        .collect();
 
-    let vertices: usize = meshes.iter().map(|m| m.vertex_count()).sum();
-    renderer.upload_chunks(&meshes);
-
-    BuiltWorld {
-        chunks_total: grid.len(),
-        chunks_drawn: meshes.len(),
-        vertices,
-        generation_ms,
-        meshing_ms,
-        report_line: report::format(cfg, &stats).replace('\n', " | "),
-        grid,
-    }
+    positions
+        .par_iter()
+        .map(|&pos| {
+            let mesh = mesh_chunk(world.get(pos).expect("position came from the world"));
+            ChunkMeshData::new(pos, &mesh)
+        })
+        .filter(|data| !data.is_empty())
+        .collect()
 }
 
 /// Rebuilds the overlay if its content changed.
@@ -403,6 +516,8 @@ fn update_hud(
     last_hud: &mut Option<String>,
     carver: Carver,
     cfg: &Config,
+    benchmark_mode: bool,
+    parity: CarveParity,
     state: &mut State,
 ) {
     // `stats()` needs a mutable borrow, so it is taken once and reused.
@@ -413,9 +528,19 @@ fn update_hud(
         carver,
         chunks_drawn: state.uploaded_chunks,
         vertices: state.uploaded_vertices,
-        chunks_total: state.chunks_total,
+        // "total" is the world actually held in memory, which is the halo, not
+        // the render distance; that is what the ratio should describe.
+        chunks_total: state.world.len(),
         generation_ms: state.generation_ms,
         meshing_ms: state.meshing_ms,
+        upload_ms: state.upload_ms,
+        chunks_streamed: state.chunks_streamed,
+        render_distance: RENDER_DISTANCE,
+        chunks_generated: state.world.chunks_generated_total(),
+        ms_per_chunk: state.world.ms_per_chunk(),
+        benchmark_mode,
+        density_percent: parity.density_percent(),
+        sparse_percent: parity.sparse_percent(),
         camera_pos: state.camera.eye,
         yaw: state.camera.yaw,
         pitch: state.camera.pitch,
@@ -491,65 +616,20 @@ fn apply_input(state: &mut State, keys: &[KeyCode], dt: f32) {
     }
 }
 
-/// Meshes every non-skippable chunk.
+/// Spawns the camera above the middle of the world, looking along it.
 ///
-/// Chunks the cull flags already reject are skipped here too: meshing a chunk
-/// that can never be drawn is pure waste, and the flags are cheap to read.
-fn mesh_grid(grid: &ChunkGrid, cfg: &Config) -> Vec<ChunkMeshData> {
-    use rayon::prelude::*;
-
-    // Distance culling is applied here rather than per frame: the camera starts
-    // at world centre, and re-meshing on every move would dwarf the draw cost
-    // for a world this size.
-    let centre = ChunkPos::new(
-        cfg.world.x as i32 / 2,
-        cfg.world.y as i32 / 2,
-        cfg.world.z as i32 / 2,
-    );
-
-    let positions: Vec<ChunkPos> = grid
-        .positions()
-        .filter(|p| {
-            let c = grid.get(*p);
-            if c.empty || c.enclosed {
-                return false;
-            }
-            // Keep the whole world when it is smaller than the view radius.
-            let world_span = cfg.world.x.max(cfg.world.y).max(cfg.world.z) as i32;
-            world_span <= VIEW_RADIUS_CHUNKS || p.chebyshev(centre) <= VIEW_RADIUS_CHUNKS
-        })
-        .collect();
-
-    positions
-        .par_iter()
-        .map(|&pos| {
-            let mesh = mesh_chunk(grid.get(pos));
-            ChunkMeshData::new(pos, &mesh)
-        })
-        .filter(|data| !data.is_empty())
-        .collect()
-}
-
-/// Places the camera looking across the generated world from outside it.
-fn default_camera(cfg: &Config, _grid: &ChunkGrid) -> Camera {
-    let (sx, sy, sz) = (cfg.world.x as f32 * 16.0, cfg.world.y as f32 * 16.0, cfg.world.z as f32 * 16.0);
-    // Sit back and above, looking toward the middle of the terrain, so the
-    // first frame shows the world rather than the inside of a hill.
+/// The world is now unbounded horizontally, so "the middle" is the origin. The
+/// camera starts a little above the terrain band looking slightly down, which
+/// puts ground and sky in the first frame rather than the inside of a hill.
+fn default_camera(cfg: &Config) -> Camera {
+    let world_height = cfg.world_height() as f32;
     let mut camera = Camera {
-        eye: [sx * 0.5, sy * 0.9, sz + sz * 0.8],
+        eye: [0.0, world_height * 0.75, 0.0],
         ..Default::default()
     };
-    let target = [sx * 0.5, sy * 0.5, sz * 0.5];
-    let d = [
-        target[0] - camera.eye[0],
-        target[1] - camera.eye[1],
-        target[2] - camera.eye[2],
-    ];
-    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-3);
-    // yaw 0 faces -Z, so recover yaw from the horizontal direction.
-    camera.yaw = (-d[0] / len).atan2(-d[2] / len);
-    camera.pitch = (d[1] / len).asin().clamp(-1.5, 1.5);
-    camera.far = (sx + sy + sz) * 4.0;
+    camera.pitch = -0.35;
+    // Far plane large enough for the render distance plus some slack.
+    camera.far = (RENDER_DISTANCE as f32 * 32.0).max(512.0);
     camera
 }
 
@@ -579,65 +659,75 @@ mod tests {
         }
     }
 
+    fn streamed(carver: Carver) -> (StreamWorld, ChunkPos) {
+        let cfg = test_cfg();
+        let mut world = StreamWorld::new(
+            cfg.seed,
+            cfg.world_height(),
+            cfg.cave,
+            carver,
+        );
+        let centre = ChunkPos::new(0, 1, 0);
+        world.stream_around(centre, 3);
+        (world, centre)
+    }
+
     #[test]
     fn meshing_skips_chunks_the_cull_flags_reject() {
-        let cfg = test_cfg();
-        let (grid, _) = report::generate_world(&cfg);
-        let meshes = mesh_grid(&grid, &cfg);
+        let (world, centre) = streamed(Carver::Sparse);
+        let meshes = mesh_world(&world, centre, 3);
 
-        // Every produced mesh must correspond to a chunk that is neither empty
-        // nor enclosed, and must contain geometry.
         for m in &meshes {
-            let c = grid.get(m.pos);
+            let c = world.get(m.pos).expect("meshed chunk exists");
             assert!(!c.empty, "meshed an empty chunk at {:?}", m.pos);
             assert!(!c.enclosed, "meshed an enclosed chunk at {:?}", m.pos);
             assert!(!m.is_empty(), "produced an empty mesh for {:?}", m.pos);
         }
+        assert!(!meshes.is_empty(), "the view distance must produce geometry");
+    }
 
-        let skippable = grid.iter().filter(|(_, c)| c.empty || c.enclosed).count();
-        assert!(
-            meshes.len() + skippable <= grid.len(),
-            "meshed more chunks than exist"
-        );
-        assert!(!meshes.is_empty(), "a 2x2x2 world must produce some geometry");
+    #[test]
+    fn meshing_respects_the_render_distance() {
+        // Streaming keeps a halo wider than the render distance so flying back
+        // and forth does not regenerate ground, and the mesher must not draw
+        // that halo.
+        let (world, centre) = streamed(Carver::Sparse);
+        let radius = 2;
+        let meshes = mesh_world(&world, centre, radius);
+        for m in &meshes {
+            assert!(
+                m.pos.chebyshev(centre) <= radius,
+                "meshed {:?}, which is outside the render distance of {radius}",
+                m.pos
+            );
+        }
     }
 
     #[test]
     fn meshing_is_deterministic_across_rayon_runs() {
-        let (grid, _) = report::generate_world(&test_cfg());
-        let cfg = test_cfg();
-        let a = mesh_grid(&grid, &cfg);
-        let b = mesh_grid(&grid, &cfg);
+        let (world, centre) = streamed(Carver::Sparse);
+        let a = mesh_world(&world, centre, 3);
+        let b = mesh_world(&world, centre, 3);
         assert_eq!(a.len(), b.len(), "parallel meshing must be deterministic");
         let count = |v: &[ChunkMeshData]| v.iter().map(|m| m.vertex_count()).sum::<usize>();
         assert_eq!(count(&a), count(&b));
     }
 
     #[test]
-    fn default_camera_looks_toward_the_world_centre() {
+    fn the_default_camera_spawns_above_the_terrain_not_inside_it() {
         let cfg = test_cfg();
-        let grid = ChunkGrid::new(cfg.world.x, cfg.world.y, cfg.world.z);
-        let camera = default_camera(&cfg, &grid);
+        let camera = default_camera(&cfg);
 
-        let centre = [
-            cfg.world.x as f32 * 8.0,
-            cfg.world.y as f32 * 8.0,
-            cfg.world.z as f32 * 8.0,
-        ];
-        let to_centre = [
-            centre[0] - camera.eye[0],
-            centre[1] - camera.eye[1],
-            centre[2] - camera.eye[2],
-        ];
-        let len = (to_centre[0].powi(2) + to_centre[1].powi(2) + to_centre[2].powi(2)).sqrt();
-        let dir = [to_centre[0] / len, to_centre[1] / len, to_centre[2] / len];
-        let f = camera.forward();
-        let dot = f[0] * dir[0] + f[1] * dir[1] + f[2] * dir[2];
+        // Inside the vertical band, but high enough to see ground rather than
+        // being buried in it.
+        let height = cfg.world_height() as f32;
+        assert!(camera.eye[1] > 0.0 && camera.eye[1] < height);
         assert!(
-            dot > 0.99,
-            "camera should face the world centre, dot = {dot}"
+            camera.eye[1] > height * 0.5,
+            "spawn should be in the upper half so the ground is visible"
         );
-        assert!(camera.far > len, "far plane must reach the world");
+        assert!(camera.pitch < 0.0, "should look slightly downward");
+        assert!(camera.far >= RENDER_DISTANCE as f32 * 16.0, "far plane too short");
         assert!(camera.aspect > 0.0);
     }
 
@@ -652,6 +742,9 @@ mod tests {
         assert!(camera.eye[2] < before[2], "yaw 0 faces -Z, so z decreases");
     }
 
-    /// A zero or negative radius would silently disable distance culling.
-    const _: () = assert!(VIEW_RADIUS_CHUNKS > 0);
+    /// A zero or negative radius would silently disable distance culling, and a
+    /// halo narrower than the render distance would evict chunks the mesher is
+    /// about to ask for.
+    const _: () = assert!(RENDER_DISTANCE > 0);
+    const _: () = assert!(EVICT_RADIUS > RENDER_DISTANCE);
 }

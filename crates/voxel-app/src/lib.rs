@@ -12,3 +12,4 @@ pub mod hud;
 pub mod logging;
 pub mod render;
 pub mod stats;
+pub mod stream;

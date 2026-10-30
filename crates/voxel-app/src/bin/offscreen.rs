@@ -197,6 +197,19 @@ fn sample_hud(
         chunks_total,
         generation_ms: stats.elapsed.as_secs_f32() * 1000.0,
         meshing_ms: 0.0,
+        upload_ms: 0.0,
+        chunks_streamed: chunks_drawn,
+        render_distance: voxel_app::app::RENDER_DISTANCE,
+        chunks_generated: chunks_drawn as u64,
+        ms_per_chunk: if chunks_drawn > 0 {
+            stats.elapsed.as_secs_f32() * 1000.0 / chunks_drawn as f32
+        } else {
+            0.0
+        },
+        // On, so a captured frame documents the timing and coverage readout.
+        benchmark_mode: true,
+        density_percent: voxel_core::CarveParity::measure(cfg.seed, &cfg.cave, 2).density_percent(),
+        sparse_percent: voxel_core::CarveParity::measure(cfg.seed, &cfg.cave, 2).sparse_percent(),
         camera_pos: [16.0, 70.0, 60.0],
         yaw: 0.0,
         pitch: -0.6,

@@ -372,6 +372,14 @@ impl Config {
         Ok(cfg)
     }
 
+    /// World height in voxels.
+    ///
+    /// The streamed world is unbounded horizontally but fixed vertically, and
+    /// the height is what the surface band is fitted to.
+    pub fn world_height(&self) -> u32 {
+        self.world.y * 16
+    }
+
     /// Every knob that differs between a dev and a prod run, for the boot log.
     pub fn summary(&self) -> String {
         format!(
