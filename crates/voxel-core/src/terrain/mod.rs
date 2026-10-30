@@ -4,12 +4,15 @@
 //!   both carvers, so the two cave paradigms are compared on equal footing.
 //! * **Pass 2A** — [`density`]: full 3D noise per voxel, `O(N^3)`; [`mc`]: the
 //!   same cost, with the three cave types Minecraft 1.18+ actually uses.
+//! * **Pass 2C** — [`capsule`]: no 3D noise at all. Three 2D fields at `(x, z)`
+//!   place, depth and aim capsule-chain tunnels; Y is arithmetic.
 //! * **Pass 2B** — [`sparse`]: deterministic origin lookup plus bounded SDF
 //!   stamps, `O(S)`.
 //!
 //! Both Pass 2 implementations consume the same Pass 1 output and the same
 //! [`CarveTarget`], so the benchmark measures only the cave-carving strategy.
 
+pub mod capsule;
 pub mod density;
 pub mod heightmap;
 pub mod mc;

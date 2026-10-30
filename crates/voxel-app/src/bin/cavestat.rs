@@ -12,7 +12,7 @@
 use voxel_core::config::{CaveParams, Config};
 use voxel_core::debug::caves::{self, CaveMask};
 use voxel_core::debug::report;
-use voxel_core::terrain::mc;
+use voxel_core::terrain::{capsule, mc};
 use voxel_core::{Carver, Env, RenderConfig, WorldSize};
 
 /// Chunks per side. Big enough that a connected tunnel system can span several
@@ -39,25 +39,31 @@ fn main() {
     );
     println!("{}", "-".repeat(62));
 
-    // The MC-faithful carver is not behind the `Carver` enum yet, so it is
-    // measured directly: same grid, same statistics, same world size.
-    {
+    // The two new carvers are not behind the `Carver` enum yet, so they are
+    // measured directly: same grid, same statistics, same world size, so the
+    // rows are comparable to the enum-driven ones below.
+    /// A carver callable directly, for the two not yet behind `Carver`.
+    type CarveFn = fn(&mut voxel_core::world::Chunk, u32) -> u64;
+    let direct: [(&str, CarveFn); 2] = [("mc", mc::carve), ("capsule", capsule::carve)];
+    for (name, carve) in direct {
         let hm = voxel_core::terrain::heightmap::HeightMap::fitted_to_world(1337, SIDE * 16);
         let mut grid = voxel_core::world::ChunkGrid::new(SIDE, SIDE, SIDE);
         let start = std::time::Instant::now();
+        let mut samples = 0u64;
         for pos in grid.positions().collect::<Vec<_>>() {
             let c = grid.get_mut(pos);
             voxel_core::terrain::generate_surface(c, pos, &hm);
-            mc::carve(c, 1337);
+            samples += carve(c, 1337);
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         let stats = caves::measure(&grid, SIDE as i32, CaveMask::Underground);
         println!(
             "{:<9} {:>6.1}% {:>12.1}% {:>11} {:>7} {:>9.1}",
-            "mc", stats.void_fraction() * 100.0,
+            name, stats.void_fraction() * 100.0,
             stats.largest_component_share() * 100.0,
             stats.components, stats.trunk_length, ms,
         );
+        println!("{:<9} noise samples: {samples}", "");
     }
 
     for carver in ALL {

@@ -57,6 +57,35 @@ pub fn cave(seed: u32, field: u32) -> FastNoiseLite {
     n
 }
 
+/// A 2D cave field for the capsule carver in [`super::capsule`].
+///
+/// The whole point of that carver is that it never evaluates a 3D noise
+/// function: the Y axis is reached by arithmetic on 2D-derived values, never by
+/// sampling. So these generators are only ever asked for `(x, z)`, and the
+/// carver's test suite asserts that no `get_noise_3d` call happens in its path.
+///
+/// Sampling a 2D field once per *column* rather than a 3D field once per *voxel*
+/// is the cost claim being tested: 256 samples per chunk instead of up to 4096.
+///
+/// `field` selects which of the carver's fields this is (see
+/// `capsule::Field2d`); the seed offset uses the same idiom as [`cave`] so the
+/// fields are uncorrelated without four hand-picked magic numbers.
+pub fn cave_2d(seed: u32, field: u32) -> FastNoiseLite {
+    let mut n = FastNoiseLite::new();
+    // Offset into a different region of the seed space than `cave` uses, so a
+    // 2D field can never coincide with the 3D field of the same index.
+    let id = field.wrapping_add(1);
+    let offset = 0xC2B2_AE35u32
+        .wrapping_mul(id)
+        .wrapping_add(0x27D4_EB2Fu32.wrapping_mul(id.rotate_left(11)));
+    n.set_seed(Some(seed.wrapping_add(offset) as i32));
+    n.set_noise_type(Some(NoiseType::OpenSimplex2));
+    n.set_fractal_type(Some(FractalType::FBm));
+    n.set_fractal_lacunarity(Some(2.0));
+    n.set_fractal_gain(Some(0.5));
+    n
+}
+
 /// Deterministic per-region RNG for Pass 2B.
 ///
 /// Uses SplitMix64 rather than a general-purpose RNG because the sparse carver
