@@ -1,0 +1,72 @@
+//! `cavestat` — cave shape statistics for each carver, side by side.
+//!
+//! Coverage parity is not likeness: a field of disconnected blobs and a
+//! connected tunnel system can remove identical fractions of rock and look
+//! nothing alike. This binary prints the statistics that separate them, so a
+//! carver change can be judged on shape rather than only on speed.
+//!
+//! ```text
+//! cargo run --release -p voxel-app --bin cavestat
+//! ```
+
+use voxel_core::config::{CaveParams, Config};
+use voxel_core::debug::caves::{self, CaveMask};
+use voxel_core::debug::report;
+use voxel_core::{Carver, Env, RenderConfig, WorldSize};
+
+/// Chunks per side. Big enough that a connected tunnel system can span several
+/// chunks, which is the only way connectivity means anything.
+const SIDE: u32 = 8;
+
+const ALL: [Carver; 2] = [Carver::Density, Carver::Sparse];
+
+fn main() {
+    let params = CaveParams {
+        origin_density: 2.0,
+        min_radius: 1.5,
+        max_radius: 4.0,
+    };
+
+    println!(
+        "{SIDE}x{SIDE}x{SIDE} chunks, seed 1337, origin_density 2\n\
+         connectivity = share of cave air in the single largest connected component\n\
+         MC noise caves are one connected field, so a high score is the MC-like result\n"
+    );
+    println!(
+        "{:<9} {:>7} {:>13} {:>11} {:>7} {:>9}",
+        "carver", "void%", "connectivity", "components", "trunk", "gen_ms"
+    );
+    println!("{}", "-".repeat(62));
+
+    for carver in ALL {
+        let cfg = Config {
+            env: Env::Dev,
+            world: WorldSize {
+                x: SIDE,
+                y: SIDE,
+                z: SIDE,
+            },
+            seed: 1337,
+            carver,
+            cave: params,
+            validation: false,
+            debug_views: false,
+            frame_dump: false,
+            render: RenderConfig {
+                force_software_gpu: false,
+                vsync: false,
+            },
+        };
+        let (grid, rep) = report::generate_world(&cfg);
+        let stats = caves::measure(&grid, SIDE as i32, CaveMask::Underground);
+        println!(
+            "{:<9} {:>6.1}% {:>12.1}% {:>11} {:>7} {:>9.1}",
+            carver.to_string(),
+            stats.void_fraction() * 100.0,
+            stats.largest_component_share() * 100.0,
+            stats.components,
+            stats.trunk_length,
+            rep.elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+}
