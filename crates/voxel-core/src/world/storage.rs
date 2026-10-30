@@ -125,9 +125,15 @@ impl VoxelGroup {
 ///
 /// The flags exist so the renderer can skip work without touching voxel data
 /// at all (`PROJECT.md` §4.3).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Chunk {
     voxels: VoxelGroup,
+    /// Where this chunk sits in the world.
+    ///
+    /// Stored rather than passed alongside, because carvers and the mesher need
+    /// to convert between local and world space and a second source of truth
+    /// is how a chunk ends up generated with its neighbour's offset.
+    pos: ChunkPos,
     /// Set while the chunk has not been generated yet.
     pub dirty: bool,
     /// Cached "is every voxel air".
@@ -136,7 +142,30 @@ pub struct Chunk {
     pub enclosed: bool,
 }
 
+impl Default for Chunk {
+    fn default() -> Self {
+        Self::at(ChunkPos::ORIGIN)
+    }
+}
+
 impl Chunk {
+    /// A fresh, all-air chunk at `pos`.
+    pub fn at(pos: ChunkPos) -> Self {
+        Self {
+            voxels: VoxelGroup::default(),
+            pos,
+            dirty: true,
+            empty: true,
+            enclosed: false,
+        }
+    }
+
+    /// This chunk's position in the world.
+    #[inline]
+    pub const fn pos(&self) -> ChunkPos {
+        self.pos
+    }
+
     #[inline]
     pub fn get(&self, index: VoxelIndex) -> PackedVoxel {
         self.voxels.get(index.to_local())
@@ -243,9 +272,16 @@ impl ChunkGrid {
             size_x > 0 && size_y > 0 && size_z > 0,
             "chunk grid dimensions must be non-zero"
         );
-        let count = size_x as usize * size_y as usize * size_z as usize;
+        let mut chunks = Vec::with_capacity(size_x as usize * size_y as usize * size_z as usize);
+        for y in 0..size_y as i32 {
+            for z in 0..size_z as i32 {
+                for x in 0..size_x as i32 {
+                    chunks.push(Chunk::at(ChunkPos::new(x, y, z)));
+                }
+            }
+        }
         Self {
-            chunks: (0..count).map(|_| Chunk::default()).collect(),
+            chunks,
             size_x,
             size_y,
             size_z,

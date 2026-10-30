@@ -139,9 +139,13 @@ impl WorldSize {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CaveParams {
-    /// Expected cave origins per unit volume. Pass 2B iterates the origins
-    /// whose padded AABB can touch the requested region; this number is what
-    /// makes that iteration `O(S)` instead of `O(N^3)`.
+    /// Expected cave origins per 1000 voxels-cubed. Pass 2B iterates only the
+    /// origins whose padded AABB can touch the requested chunk, so this number
+    /// (not the world volume) is what its cost scales with.
+    ///
+    /// Per-1000 rather than per-voxel so the values stay readable: the 0.02
+    /// default is about one cave origin per 50k voxels, i.e. a handful per
+    /// 64-voxel region.
     pub origin_density: f32,
     pub min_radius: f32,
     pub max_radius: f32,
