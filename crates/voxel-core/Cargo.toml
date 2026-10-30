@@ -1,0 +1,21 @@
+[package]
+name = "voxel-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Data-oriented voxel world generation core: chunk storage, cave carving, greedy meshing."
+
+[dependencies]
+bytemuck.workspace = true
+dotenvy.workspace = true
+fastnoise-lite.workspace = true
+log.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "carvers"
+harness = false

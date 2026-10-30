@@ -1,0 +1,19 @@
+[package]
+name = "voxel-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wgpu + winit front end for the voxel world-gen POC."
+
+[dependencies]
+voxel-core.workspace = true
+
+anyhow.workspace = true
+bytemuck.workspace = true
+env_logger.workspace = true
+log.workspace = true
+pollster.workspace = true
+rayon.workspace = true
+wgpu.workspace = true
+winit.workspace = true

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/voxel-core", "crates/voxel-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.99"
+
+[workspace.dependencies]
+voxel-core = { path = "crates/voxel-core" }
+
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
+dotenvy = "0.15.7"
+fastnoise-lite = "1.1.1"
+log = "0.4.34"
+env_logger = "0.11.11"
+pollster = "1.0.1"
+rayon = "1.12.0"
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+# Small world by default; benches and prod override via env.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Generation and meshing are unusably slow unoptimised, so dev keeps deps hot
+# but debug asserts on. `just release` (APP_ENV=prod) is the real speed path.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

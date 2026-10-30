@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Machine-local config overrides (never commit secrets or host paths).
+.env.local
+.env.*.local
+
+# Debug-view artefacts produced by `voxel-app debug`.
+/debug-out/
+
+# Workspace-local CARGO_HOME used when ~/.cargo is not writable.
+/.cargo-home/
