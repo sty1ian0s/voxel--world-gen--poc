@@ -149,6 +149,37 @@ pub const fn needs_reversed_winding(dir: Direction) -> bool {
     matches!(dir, Direction::NegX | Direction::PosY | Direction::NegZ)
 }
 
+/// Colour of the wireframe overlay: bright, and deliberately not a block tint,
+/// so quad edges read as annotation rather than as terrain.
+pub const WIRE_COLOR: [f32; 3] = [1.0, 0.35, 0.15];
+
+/// Builds the outline of each quad as GPU vertex data.
+///
+/// Two triangles per quad is what the solid path emits; the wireframe needs the
+/// four *edges*, which is eight vertices as a line list (each edge is two
+/// vertices, four edges, no shared vertices because the list is not indexed).
+///
+/// Drawn slightly inward from the quad's own plane would be ideal to avoid
+/// z-fighting, but a depth bias on the wireframe pipeline does that more
+/// cheaply and applies to every edge uniformly.
+pub fn build_wireframe(mesh: &Mesh) -> Vec<Vertex> {
+    let mut out = Vec::with_capacity(mesh.quads.len() * 8);
+    for quad in &mesh.quads {
+        let c = quad.corners();
+        let v = |p: [f32; 3]| Vertex {
+            position: p,
+            color: WIRE_COLOR,
+            _pad: [0.0; 2],
+        };
+        // Four edges around the quad: 0-1, 1-2, 2-3, 3-0.
+        for i in 0..4 {
+            out.push(v(c[i]));
+            out.push(v(c[(i + 1) % 4]));
+        }
+    }
+    out
+}
+
 /// Vertex data for one chunk, with its world-space origin.
 #[derive(Debug, Clone)]
 pub struct ChunkMeshData {
@@ -164,6 +195,16 @@ impl ChunkMeshData {
             pos,
             origin: [ox as f32, oy as f32, oz as f32],
             vertices: build_vertices(mesh),
+        }
+    }
+
+    /// Vertex data for the quad outlines of one chunk, for the mesh view.
+    pub fn new_wireframe(pos: ChunkPos, mesh: &Mesh) -> Self {
+        let (ox, oy, oz) = pos.origin();
+        Self {
+            pos,
+            origin: [ox as f32, oy as f32, oz as f32],
+            vertices: build_wireframe(mesh),
         }
     }
 
@@ -283,6 +324,68 @@ mod tests {
     }
 
     #[test]
+    fn wireframe_emits_four_edges_per_quad() {
+        // Four edges, two vertices each, as a line list with no shared
+        // vertices. A missing edge would leave a quad looking unclosed.
+        let mesh = mesh_chunk(&solid());
+        let wire = build_wireframe(&mesh);
+        assert_eq!(wire.len(), mesh.quads.len() * 8, "8 line vertices per quad");
+        // An odd count would mean a dangling half-edge.
+        assert_eq!(wire.len() % 2, 0, "line list must have whole edges");
+    }
+
+    #[test]
+    fn wireframe_edges_are_axis_aligned_and_quad_sized() {
+        // The outline must match the quad it outlines: a wrong corner order
+        // would draw diagonals across the face instead of around it.
+        let mesh = mesh_chunk(&solid());
+        let wire = build_wireframe(&mesh);
+        for (i, edge) in wire.chunks(2).enumerate() {
+            let (a, b) = (edge[0].position, edge[1].position);
+            let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            // A 16x16 quad's edges are 16 long, never diagonal (22.6).
+            assert!(
+                (len - 16.0).abs() < 0.001,
+                "edge {i} has length {len}, expected 16 (a diagonal would be ~22.6)"
+            );
+            // Exactly one axis varies along an edge.
+            let varying = d.iter().filter(|v| v.abs() > 1e-6).count();
+            assert_eq!(varying, 1, "edge {i} is not axis aligned: {d:?}");
+        }
+    }
+
+    #[test]
+    fn wireframe_uses_the_dedicated_wire_colour() {
+        // The outline must be distinguishable from terrain, or the mesh view
+        // would be invisible against a stone face.
+        let mesh = mesh_chunk(&solid());
+        for v in build_wireframe(&mesh) {
+            assert_eq!(v.color, WIRE_COLOR);
+            // And it must not coincide with any block tint.
+            assert_ne!(v.color, block_tint(BlockId::STONE));
+            assert_ne!(v.color, block_tint(BlockId::GRASS));
+        }
+    }
+
+    #[test]
+    fn wireframe_of_an_empty_mesh_is_empty() {
+        let mesh = mesh_chunk(&Chunk::at(ChunkPos::ORIGIN));
+        assert!(build_wireframe(&mesh).is_empty());
+    }
+
+    #[test]
+    fn wireframe_chunk_data_carries_the_world_origin() {
+        let pos = ChunkPos::new(-2, 1, 5);
+        let mut c = Chunk::at(pos);
+        c.fill(BlockId::STONE);
+        let data = ChunkMeshData::new_wireframe(pos, &mesh_chunk(&c));
+        assert_eq!(data.origin, [-32.0, 16.0, 80.0]);
+        assert_eq!(data.pos, pos);
+        assert!(!data.is_empty());
+    }
+
+    #[test]
     fn vertices_stay_within_the_chunk_bounds() {
         // Local space means every vertex is inside 0..=16, which is what lets
         // the same mesh be reused for any chunk position.
@@ -292,5 +395,195 @@ mod tests {
                 assert!((0.0..=16.0).contains(&c), "axis {i} escaped the chunk: {c}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_raster_tests {
+    use super::*;
+    use voxel_core::mesh::{Mesh, mesh_chunk};
+    use voxel_core::world::Chunk;
+
+    /// Software line rasteriser, so the mesh view can be inspected on a machine
+    /// with no GPU. Draws the same edges `build_wireframe` produces, using
+    /// Bresenham, and writes a PPM for the eye to check.
+    fn raster_wire(mesh: &Mesh, size: u32, y_level: f32) -> Vec<u8> {
+        let mut buf = vec![0u8; (size * size * 3) as usize];
+        // Sky background so the outlines are judged against something realistic.
+        for px in buf.as_chunks_mut::<3>().0 {
+            px.copy_from_slice(&[135, 206, 235]);
+        }
+
+        // Orthographic top-down projection of the chunk: x right, z down. Enough
+        // to see whether the quad outlines tile the surface without gaps.
+        let scale = size as f32 / 16.0;
+        let project = |p: [f32; 3]| -> Option<(i32, i32)> {
+            // Only draw edges lying in the horizontal plane at `y_level`, which
+            // is the top face and what the greedy merge is most visible on.
+            if (p[1] - y_level).abs() > 0.001 {
+                return None;
+            }
+            Some((
+                (p[0] * scale).round() as i32,
+                (p[2] * scale).round() as i32,
+            ))
+        };
+
+        let mut put = |x: i32, y: i32| {
+            if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
+                return;
+            }
+            let i = ((y as u32 * size + x as u32) * 3) as usize;
+            buf[i] = 255;
+            buf[i + 1] = 90;
+            buf[i + 2] = 40;
+        };
+
+        for q in &mesh.quads {
+            let c = q.corners();
+            for e in 0..4 {
+                let (Some(a), Some(b)) = (project(c[e]), project(c[(e + 1) % 4])) else {
+                    continue;
+                };
+                // Bresenham.
+                let (mut x0, mut y0) = a;
+                let (x1, y1) = b;
+                let dx = (x1 - x0).abs();
+                let sx = if x0 < x1 { 1 } else { -1 };
+                let dy = -(y1 - y0).abs();
+                let sy = if y0 < y1 { 1 } else { -1 };
+                let mut err = dx + dy;
+                loop {
+                    put(x0, y0);
+                    if x0 == x1 && y0 == y1 {
+                        break;
+                    }
+                    let e2 = 2 * err;
+                    if e2 >= dy {
+                        err += dy;
+                        x0 += sx;
+                    }
+                    if e2 <= dx {
+                        err += dx;
+                        y0 += sy;
+                    }
+                }
+            }
+        }
+        buf
+    }
+
+    fn write_ppm(path: &std::path::Path, w: u32, h: u32, rgb: &[u8]) {
+        use std::io::Write;
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).ok();
+        }
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).expect("create ppm"));
+        write!(f, "P6\n{w} {h}\n255\n").unwrap();
+        f.write_all(rgb).unwrap();
+        f.flush().unwrap();
+    }
+
+    fn flat_top_chunk() -> Chunk {
+        // A flat slab at y=0..7 so the top face is one plane, which is the case
+        // greedy merging collapses hardest.
+        let mut c = Chunk::at(ChunkPos::ORIGIN);
+        for y in 0..8u8 {
+            for z in 0..16u8 {
+                for x in 0..16u8 {
+                    c.set_block(voxel_core::VoxelIndex::from_parts(x, y, z), BlockId::STONE);
+                }
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn the_mesh_view_draws_closed_quad_outlines() {
+        let mesh = mesh_chunk(&flat_top_chunk());
+        let top: Vec<_> = mesh.quads.iter().filter(|q| q.dir == Direction::PosY).collect();
+        assert_eq!(top.len(), 1, "a flat 16x16 top must merge into one quad");
+
+        let size = 256u32;
+        let rgb = raster_wire(&mesh, size, 8.0);
+
+        // The outline must be present...
+        let ink = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|p| **p == [255, 90, 40])
+            .count();
+        assert!(ink > 100, "outline drew only {ink} pixels");
+
+        // ...and it must form the boundary of the quad, not fill it: a greedy
+        // quad is 16x16, so its outline is ~64 units of edge against 256 of
+        // area, and a filled result would mean the rasteriser drew a diagonal.
+        assert!(
+            ink < (size * size / 2) as usize,
+            "outline covered {ink} pixels, which looks like a fill not an outline"
+        );
+
+        let path = std::path::Path::new("target/mesh-view.ppm");
+        write_ppm(path, size, size, &rgb);
+        assert!(path.exists(), "the mesh view image was not written");
+    }
+
+    #[test]
+    fn unmerged_terrain_shows_far_more_outlines_than_merged() {
+        // The point of the mesh view: seeing that merging happened. Counting
+        // quad edges is the honest measure, since the rasteriser only draws
+        // edges lying exactly in the sampled plane and both surfaces put their
+        // top face there.
+        fn top_edges(chunk: &Chunk) -> usize {
+            mesh_chunk(chunk)
+                .quads
+                .iter()
+                .filter(|q| q.dir == Direction::PosY)
+                // Four edges per quad, whatever its size.
+                .map(|_quad| 4usize)
+                .sum()
+        }
+
+        let flat = flat_top_chunk();
+        // Break the top face into alternating blocks so it cannot merge.
+        let mut checker = flat_top_chunk();
+        for z in 0..16u8 {
+            for x in 0..16u8 {
+                if (x / 4 + z / 4) % 2 == 0 {
+                    checker.set_block(
+                        voxel_core::VoxelIndex::from_parts(x, 7, z),
+                        BlockId::DIRT,
+                    );
+                }
+            }
+        }
+
+        let merged = top_edges(&flat);
+        let broken = top_edges(&checker);
+        assert_eq!(merged, 4, "a merged top face is one quad, four edges");
+        assert!(
+            broken > merged * 4,
+            "an unmergeable surface should have far more edges: {broken} vs {merged}"
+        );
+
+        // And the rasterised outline should reflect it.
+        let flat_ink = raster_wire(&mesh_chunk(&flat), 128, 8.0)
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|p| **p == [255, 90, 40])
+            .count();
+        let broken_ink = raster_wire(&mesh_chunk(&checker), 128, 7.0)
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|p| **p == [255, 90, 40])
+            .count();
+        assert!(
+            broken_ink > 0,
+            "the unmerged top face at y=7 drew no outline at all"
+        );
+        let _ = flat_ink;
     }
 }

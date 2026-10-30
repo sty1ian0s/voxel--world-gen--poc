@@ -298,6 +298,21 @@ impl ApplicationHandler for App {
                             self.carver.toggle();
                             log::info!("carver switch queued");
                         }
+                        // Mesh view: draw the greedy quad outlines over the
+                        // terrain, so the merging is visible rather than
+                        // merely reported as a quad count.
+                        KeyCode::KeyM => {
+                            state.renderer.wire_visible = !state.renderer.wire_visible;
+                            log::info!(
+                                "mesh view {}",
+                                if state.renderer.wire_visible { "on" } else { "off" }
+                            );
+                            if state.renderer.wire_visible {
+                                rebuild_wireframe(state, self.cfg.seed);
+                            } else {
+                                state.renderer.upload_wireframe(&[]);
+                            }
+                        }
                         // Toggle the generation-timing and carve-coverage block.
                         KeyCode::KeyB => {
                             self.benchmark_mode = !self.benchmark_mode;
@@ -353,6 +368,15 @@ impl ApplicationHandler for App {
                     state.upload_ms = t2.elapsed().as_secs_f32() * 1000.0;
                     state.chunks_streamed = 0;
 
+                    if state.renderer.wire_visible {
+                        let wire = mesh_world_wireframe(
+                            &state.world,
+                            state.last_centre,
+                            RENDER_DISTANCE,
+                        );
+                        state.renderer.upload_wireframe(&wire);
+                    }
+
                     // The old world's frame times say nothing about the new
                     // one, so the window starts clean rather than blending the
                     // two carvers together in the percentiles.
@@ -402,6 +426,15 @@ impl ApplicationHandler for App {
                         state.uploaded_chunks = meshes.len();
                         state.renderer.upload_chunks(&meshes);
                         state.upload_ms = t2.elapsed().as_secs_f32() * 1000.0;
+
+                        // The outlines belong to the chunks that just changed,
+                        // so they have to follow or the mesh view would show a
+                        // world that no longer exists.
+                        if state.renderer.wire_visible {
+                            let wire =
+                                mesh_world_wireframe(&state.world, centre, RENDER_DISTANCE);
+                            state.renderer.upload_wireframe(&wire);
+                        }
 
                         log::info!(
                             "streamed {added} chunks in {:.1}ms, meshed {} in {:.1}ms, \
@@ -472,6 +505,18 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Rebuilds the quad-outline geometry for the whole view distance.
+///
+/// Separate from the solid mesh because the wireframe is opt-in: keeping it
+/// uploaded while hidden would roughly double the vertex memory for geometry
+/// nobody is looking at.
+fn rebuild_wireframe(state: &mut State, _seed: u32) {
+    let wire = mesh_world_wireframe(&state.world, state.last_centre, RENDER_DISTANCE);
+    let lines: usize = wire.iter().map(|m| m.vertex_count()).sum();
+    log::info!("mesh view: {} chunks, {lines} line vertices", wire.len());
+    state.renderer.upload_wireframe(&wire);
+}
+
 /// Meshes every drawable chunk within the render distance of `centre`.
 ///
 /// Only chunks inside the radius are meshed, even though the world keeps a
@@ -502,6 +547,35 @@ fn mesh_world(
         .map(|&pos| {
             let mesh = mesh_chunk(world.get(pos).expect("position came from the world"));
             ChunkMeshData::new(pos, &mesh)
+        })
+        .filter(|data| !data.is_empty())
+        .collect()
+}
+
+/// Builds quad-outline geometry for the drawable chunks in view.
+fn mesh_world_wireframe(
+    world: &StreamWorld,
+    centre: ChunkPos,
+    radius: i32,
+) -> Vec<ChunkMeshData> {
+    use rayon::prelude::*;
+
+    let positions: Vec<ChunkPos> = world
+        .positions()
+        .filter(|p| {
+            if p.chebyshev(centre) > radius {
+                return false;
+            }
+            let c = world.get(*p).expect("position came from the world");
+            !c.empty && !c.enclosed
+        })
+        .collect();
+
+    positions
+        .par_iter()
+        .map(|&pos| {
+            let mesh = mesh_chunk(world.get(pos).expect("position came from the world"));
+            ChunkMeshData::new_wireframe(pos, &mesh)
         })
         .filter(|data| !data.is_empty())
         .collect()

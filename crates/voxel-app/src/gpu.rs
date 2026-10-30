@@ -177,6 +177,12 @@ pub struct Renderer {
     hud: Option<Hud>,
     /// Whether the HUD should be drawn.
     pub hud_visible: bool,
+    /// Quad-outline pipeline, built lazily on first use.
+    wire: Option<wgpu::RenderPipeline>,
+    /// Wireframe geometry, empty unless the mesh view is on.
+    wire_chunks: Vec<GpuChunk>,
+    /// Whether quad outlines are drawn.
+    pub wire_visible: bool,
 }
 
 /// The overlay pipeline plus the textures for the current frame's lines.
@@ -302,6 +308,9 @@ impl Renderer {
             depth_view,
             hud: None,
             hud_visible: true,
+            wire: None,
+            wire_chunks: Vec::new(),
+            wire_visible: false,
         })
     }
 
@@ -401,6 +410,9 @@ impl Renderer {
             depth_view,
             hud: None,
             hud_visible: true,
+            wire: None,
+            wire_chunks: Vec::new(),
+            wire_visible: false,
         })
     }
 
@@ -733,11 +745,16 @@ impl Renderer {
     ///
     /// Both targets draw the same chunks with the same pipeline, so any bug in
     /// the draw sequence shows up in a captured image too.
+    ///
+    /// `wire` is passed in rather than read from `self` because the wireframe
+    /// pipeline is created lazily, which needs a mutable borrow the caller has
+    /// to take before the pass begins.
     fn encode_draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         clear: wgpu::Color,
+        wire: Option<&wgpu::RenderPipeline>,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("main-pass"),
@@ -771,6 +788,20 @@ impl Renderer {
             pass.draw(0..chunk.vertex_count, 0..1);
         }
 
+        // Quad outlines go after the solid geometry so they are drawn over it,
+        // and before the HUD so the overlay stays on top of everything.
+        if let (Some(pipeline), true) = (wire, self.wire_visible)
+            && !self.wire_chunks.is_empty()
+        {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for chunk in &self.wire_chunks {
+                pass.set_bind_group(1, &chunk.origin_bind_group, &[]);
+                pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
+                pass.draw(0..chunk.vertex_count, 0..1);
+            }
+        }
+
         // The overlay goes in the same pass, after the terrain, so it needs no
         // second encoder and lands on top by draw order alone.
         self.encode_hud(&mut pass);
@@ -781,6 +812,10 @@ impl Renderer {
     /// Errors if this renderer was created for a surface, since there is no
     /// texture to read back in that case.
     pub fn render_to_rgb(&mut self, clear: wgpu::Color) -> Result<(u32, u32, Vec<u8>)> {
+        // Built before borrowing `self.target` below, since creating it needs a
+        // mutable borrow of `self`.
+        let wire = self.ensure_wire_pipeline().clone();
+
         let Target::Offscreen {
             color,
             readback,
@@ -800,7 +835,7 @@ impl Renderer {
                 label: Some("offscreen-encoder"),
             });
 
-        self.encode_draw(&mut encoder, &view, clear);
+        self.encode_draw(&mut encoder, &view, clear, Some(&wire));
 
         // Copy the rendered texture into the mappable buffer, then pull it back.
         encoder.copy_texture_to_buffer(
@@ -853,6 +888,132 @@ impl Renderer {
         readback.unmap();
 
         Ok((width, height, rgb))
+    }
+
+    /// Uploads quad outlines for the mesh view, replacing any previous batch.
+    pub fn upload_wireframe(&mut self, meshes: &[ChunkMeshData]) {
+        self.wire_chunks.clear();
+        for data in meshes {
+            if data.is_empty() {
+                continue;
+            }
+            let vertex_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("wire-vertices"),
+                    contents: bytemuck::cast_slice(&data.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let origin = [data.origin[0], data.origin[1], data.origin[2], 0.0];
+            let origin_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("wire-origin"),
+                    contents: bytemuck::cast_slice(&origin),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let origin_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wire-origin-bind-group"),
+                layout: &self.origin_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: origin_buffer.as_entire_binding(),
+                }],
+            });
+            self.wire_chunks.push(GpuChunk {
+                vertex_buffer,
+                origin_bind_group,
+                vertex_count: data.vertices.len() as u32,
+            });
+        }
+    }
+
+    /// Builds the line pipeline on first use.
+    ///
+    /// Shares the voxel shader, since a line vertex is a position and a colour
+    /// just like a triangle vertex; only the topology and depth handling differ.
+    fn ensure_wire_pipeline(&mut self) -> &wgpu::RenderPipeline {
+        if self.wire.is_none() {
+            let shader = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("wire-shader"),
+                    source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+                });
+            let layout = self
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("wire-pipeline-layout"),
+                    bind_group_layouts: &[
+                        Some(&self.camera_layout()),
+                        Some(&self.origin_layout),
+                    ],
+                    immediate_size: 0,
+                });
+
+            let pipeline = self
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("wire-pipeline"),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[Some(Vertex::LAYOUT)],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: self.config.format,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::LineList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        // Lines have no facing, so culling would drop half of
+                        // them depending on winding order.
+                        cull_mode: None,
+                        unclipped_depth: false,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        conservative: false,
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        // Depth-tested so hidden edges stay hidden, but with a
+                        // bias pulling the lines toward the camera: without it
+                        // the outline z-fights with the face it belongs to and
+                        // dashes in and out.
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState {
+                            constant: -2,
+                            slope_scale: -2.0,
+                            clamp: 0.0,
+                        },
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+            self.wire = Some(pipeline);
+        }
+        self.wire.as_ref().expect("wire pipeline was just built")
+    }
+
+    /// The camera bind group layout, reconstructed on demand.
+    ///
+    /// wgpu has no way to read a bind group's layout back, so the camera layout
+    /// is rebuilt from the bind group's own layout description. Cheap, and only
+    /// happens when the wire pipeline is first created.
+    fn camera_layout(&self) -> wgpu::BindGroupLayout {
+        uniform_layout(&self.device, "camera-layout")
     }
 
     /// Uploads a batch of chunk meshes, replacing anything already uploaded.
@@ -963,12 +1124,13 @@ impl Renderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let wire = self.ensure_wire_pipeline().clone();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-encoder"),
             });
-        self.encode_draw(&mut encoder, &view, clear);
+        self.encode_draw(&mut encoder, &view, clear, Some(&wire));
 
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);

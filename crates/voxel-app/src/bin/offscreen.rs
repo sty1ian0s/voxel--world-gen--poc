@@ -30,8 +30,12 @@ fn main() -> Result<()> {
     let cfg = Config::load().context("loading configuration")?;
     voxel_app::logging::init(cfg.env);
 
-    let out = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mesh_view = args.iter().any(|a| a == "--mesh-view");
+    let out = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
         .unwrap_or_else(|| "debug-out/offscreen.ppm".to_string());
 
     let mut cfg = cfg;
@@ -42,10 +46,10 @@ fn main() -> Result<()> {
         log::warn!("offscreen run: world clamped to {} for speed", cfg.world.chunk_count());
     }
 
-    pollster::block_on(run(cfg, PathBuf::from(out)))
+    pollster::block_on(run(cfg, PathBuf::from(out), mesh_view))
 }
 
-async fn run(cfg: Config, out: PathBuf) -> Result<()> {
+async fn run(cfg: Config, out: PathBuf, mesh_view: bool) -> Result<()> {
     let mut renderer = Renderer::new_offscreen(WIDTH, HEIGHT, true)
         .await
         .context("creating the offscreen renderer")?;
@@ -81,6 +85,19 @@ async fn run(cfg: Config, out: PathBuf) -> Result<()> {
     anyhow::ensure!(!meshes.is_empty(), "no geometry to render; nothing to verify");
 
     renderer.upload_chunks(&meshes);
+
+    // The mesh view draws the greedy quad outlines, so a captured frame shows
+    // how much merging actually happened rather than only reporting a count.
+    if mesh_view {
+        let wire: Vec<ChunkMeshData> = meshes
+            .iter()
+            .map(|m| ChunkMeshData::new_wireframe(m.pos, &mesh_chunk(grid.get(m.pos))))
+            .collect();
+        let lines: usize = wire.iter().map(|m| m.vertex_count()).sum();
+        println!("wireframe  {} chunks, {} line vertices", wire.len(), lines);
+        renderer.upload_wireframe(&wire);
+        renderer.wire_visible = true;
+    }
     println!(
         "uploaded   {} chunks, {} vertices",
         renderer.uploaded_chunks(),

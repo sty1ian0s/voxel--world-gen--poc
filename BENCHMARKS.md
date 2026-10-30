@@ -11,6 +11,22 @@ Criterion reports a confidence interval; the median is quoted below. Pass 1
 surface generation is excluded from the carver timings, since both carvers pay
 it and including it would damp the difference being measured.
 
+## Carve coverage parity
+
+Before benchmarking speed, the two carvers have to carve comparable worlds, or
+the comparison is meaningless. Both are tuned to remove about the same fraction
+of rock:
+
+| approach | setting | carved rock |
+| --- | --- | ---: |
+| density | noise threshold 0.30 | 18.9% |
+| sparse | 2.0 origins per 1000 voxels³ | 20.3% |
+
+A 1.4 point divergence. An integration test in `crates/voxel-core/tests/`
+asserts this stays within 5 points, both stay in a 10-35% band, caves appear in
+a comparable share of chunks, and that raising the sparse density still changes
+the result. That last check exists because a constant once capped it silently.
+
 ## The headline: O(N³) versus O(S)
 
 Carving `N x N` chunks (y fixed at 4), per-chunk work:
@@ -27,14 +43,30 @@ and 65.0x the time. That is the `O(N^3)` claim in `PROJECT.md` §1, confirmed
 rather than assumed: the cost is one noise sample per solid voxel, so it tracks
 the world's size.
 
-**Sparse does about 130x less work per chunk**, and that ratio holds steady
-across a 64x range of world sizes. It is not, however, asymptotically cheaper
-here, and the reason is worth stating plainly: at the default density the cave
-band spans the whole world, so cave count grows with volume too and both curves
-are linear. What sparse removes is the enormous per-voxel constant, not the
-growth rate. A world that grows around a *fixed* number of caves is where the
-orders would visibly diverge; that case is covered by the empty-region
-rejection test in the sparse module rather than by this benchmark.
+**Sparse is roughly 139x faster per chunk**, and that ratio holds across
+world sizes. The *work unit* counts need care, though, and an earlier version of
+this document got them wrong.
+
+At the current defaults both carvers remove about 19-20% of the rock, and at
+that coverage the sparse carver actually *tests more voxels* than the density
+carver samples:
+
+| | density | sparse |
+| --- | ---: | ---: |
+| voxels touched | 355,565 | 434,197 |
+| carve coverage | 18.9% | 20.3% |
+
+It still wins by 139x in time because of what each touch costs. A density sweep
+visits every solid voxel exactly once and pays for a 3D fractal noise evaluation
+at each. A sparse stamp re-tests voxels where spheres overlap, but each visit is
+a squared-distance comparison against a handful of origins. The expensive thing
+was never the number of visits.
+
+The previously published "130x less work" figure was measured at a cave density
+of 0.02, which carved 0.2% of the rock. That was very nearly an empty world, so
+the comparison flattered sparse badly. It is replaced here rather than quietly
+dropped, because the number was used to justify a claim about algorithmic
+complexity and it did not support one.
 
 ## End-to-end, both carvers, same world
 
