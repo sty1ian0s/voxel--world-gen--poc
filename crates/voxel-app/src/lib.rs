@@ -1,6 +1,11 @@
 //! Shared front-end plumbing for the binaries in this crate.
 //!
-//! `voxel-app` builds a library as well as binaries so that `main.rs` and
-//! `bin/debug.rs` share logging setup instead of each carrying a copy.
+//! `voxel-app` builds a library as well as binaries so the desktop binary and
+//! `bin/debug.rs` share camera, mesh conversion, GPU setup and logging instead
+//! of each carrying a copy.
 
+pub mod app;
+pub mod camera;
+pub mod gpu;
 pub mod logging;
+pub mod render;

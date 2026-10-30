@@ -17,3 +17,8 @@ pollster.workspace = true
 rayon.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+# Test-only: parses the inline WGSL so shader typos fail at test time rather
+# than when a real device is created. Must match the version wgpu resolves.
+naga = { version = "27", features = ["wgsl-in"] }
