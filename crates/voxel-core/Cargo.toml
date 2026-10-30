@@ -19,3 +19,7 @@ criterion.workspace = true
 [[bench]]
 name = "carvers"
 harness = false
+
+[[bench]]
+name = "latency"
+harness = false
