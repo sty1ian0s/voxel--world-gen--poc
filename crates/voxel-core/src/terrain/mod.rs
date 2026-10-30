@@ -2,7 +2,8 @@
 //!
 //! * **Pass 1** — [`heightmap`]: 2D surface height per column. Cheap, shared by
 //!   both carvers, so the two cave paradigms are compared on equal footing.
-//! * **Pass 2A** — [`density`]: full 3D noise per voxel, `O(N^3)`.
+//! * **Pass 2A** — [`density`]: full 3D noise per voxel, `O(N^3)`; [`mc`]: the
+//!   same cost, with the three cave types Minecraft 1.18+ actually uses.
 //! * **Pass 2B** — [`sparse`]: deterministic origin lookup plus bounded SDF
 //!   stamps, `O(S)`.
 //!
@@ -11,6 +12,7 @@
 
 pub mod density;
 pub mod heightmap;
+pub mod mc;
 pub mod noise;
 pub mod sparse;
 

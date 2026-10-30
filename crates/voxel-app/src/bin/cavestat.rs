@@ -12,6 +12,7 @@
 use voxel_core::config::{CaveParams, Config};
 use voxel_core::debug::caves::{self, CaveMask};
 use voxel_core::debug::report;
+use voxel_core::terrain::mc;
 use voxel_core::{Carver, Env, RenderConfig, WorldSize};
 
 /// Chunks per side. Big enough that a connected tunnel system can span several
@@ -37,6 +38,27 @@ fn main() {
         "carver", "void%", "connectivity", "components", "trunk", "gen_ms"
     );
     println!("{}", "-".repeat(62));
+
+    // The MC-faithful carver is not behind the `Carver` enum yet, so it is
+    // measured directly: same grid, same statistics, same world size.
+    {
+        let hm = voxel_core::terrain::heightmap::HeightMap::fitted_to_world(1337, SIDE * 16);
+        let mut grid = voxel_core::world::ChunkGrid::new(SIDE, SIDE, SIDE);
+        let start = std::time::Instant::now();
+        for pos in grid.positions().collect::<Vec<_>>() {
+            let c = grid.get_mut(pos);
+            voxel_core::terrain::generate_surface(c, pos, &hm);
+            mc::carve(c, 1337);
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let stats = caves::measure(&grid, SIDE as i32, CaveMask::Underground);
+        println!(
+            "{:<9} {:>6.1}% {:>12.1}% {:>11} {:>7} {:>9.1}",
+            "mc", stats.void_fraction() * 100.0,
+            stats.largest_component_share() * 100.0,
+            stats.components, stats.trunk_length, ms,
+        );
+    }
 
     for carver in ALL {
         let cfg = Config {

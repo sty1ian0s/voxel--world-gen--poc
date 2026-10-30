@@ -35,6 +35,28 @@ pub fn density(seed: u32) -> FastNoiseLite {
     n
 }
 
+/// 3D cave field for the Minecraft-style carver in [`super::mc`].
+///
+/// The seed offset is `density`'s constant scaled by the field id, so each
+/// field is uncorrelated with the others *and* with the surface and density
+/// fields, by the same idiom rather than by four hand-picked numbers that
+/// nothing keeps apart.
+///
+/// `field` picks which of the carver's fields this is (see `mc::Field`);
+/// returning the generator rather than sampling it here is what lets the
+/// carver control its own frequency and octave count per field.
+pub fn cave(seed: u32, field: u32) -> FastNoiseLite {
+    let mut n = FastNoiseLite::new();
+    let id = field.wrapping_add(1);
+    let offset = 0x9E37_79B9u32.wrapping_mul(id) ^ 0x85EB_CA6Bu32.wrapping_mul(id.rotate_left(13));
+    n.set_seed(Some(seed.wrapping_add(offset) as i32));
+    n.set_noise_type(Some(NoiseType::OpenSimplex2));
+    n.set_fractal_type(Some(FractalType::FBm));
+    n.set_fractal_lacunarity(Some(2.0));
+    n.set_fractal_gain(Some(0.5));
+    n
+}
+
 /// Deterministic per-region RNG for Pass 2B.
 ///
 /// Uses SplitMix64 rather than a general-purpose RNG because the sparse carver
@@ -88,6 +110,52 @@ impl RegionRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cave_fields_are_independent_and_seed_dependent() {
+        // The four fields the MC-style carver runs must not be the same field
+        // sampled four times, or its three cave types would carve identically.
+        let fields: Vec<_> = (0..4).map(|f| cave(1337, f)).collect();
+        let mut identical_pairs = 0;
+        for (i, a) in fields.iter().enumerate() {
+            for (j, b) in fields.iter().enumerate().skip(i + 1) {
+                if (1..24).all(|k| {
+                    let p = k as f32 * 0.37;
+                    a.get_noise_3d(p, p, p) == b.get_noise_3d(p, p, p)
+                }) {
+                    identical_pairs += 1;
+                    eprintln!("fields {i} and {j} are identical");
+                }
+            }
+        }
+        assert_eq!(identical_pairs, 0, "cave fields are not independent");
+
+        // And a different world seed must move every one of them.
+        for f in 0..4 {
+            let a = cave(1337, f);
+            let c = cave(1338, f);
+            assert!(
+                (1..24).any(|k| {
+                    let p = k as f32 * 0.37;
+                    a.get_noise_3d(p, p, p) != c.get_noise_3d(p, p, p)
+                }),
+                "field {f} ignores the world seed"
+            );
+        }
+    }
+
+    #[test]
+    fn cave_fields_are_reproducible() {
+        let a = cave(1337, 2);
+        let b = cave(1337, 2);
+        for k in 0..64 {
+            let p = k as f32 * 0.51;
+            assert_eq!(
+                a.get_noise_3d(p, p * 1.7, p * 0.3),
+                b.get_noise_3d(p, p * 1.7, p * 0.3)
+            );
+        }
+    }
 
     #[test]
     fn region_rng_is_reproducible_and_region_dependent() {
