@@ -27,6 +27,17 @@ asserts this stays within 5 points, both stay in a 10-35% band, caves appear in
 a comparable share of chunks, and that raising the sparse density still changes
 the result. That last check exists because a constant once capped it silently.
 
+At the demo's 16-chunk view distance the two worlds are also the same size:
+8.21M solid voxels under sparse against 8.59M under density, over 4356 chunks.
+
+One difference that falls out of this and is worth knowing: over those chunks
+sparse leaves **0** fully enclosed chunks where density leaves 103. Enclosed
+chunks are the ones `PROJECT.md` §4.3 culls from rendering, so sparse culls
+slightly less. Both are correct - noise-threshold carving leaves pockets of deep
+rock untouched and fully solid, while a stamp field spreads evenly enough to
+reach into nearly every deep chunk. It is a small rendering cost of the sparse
+approach, and a real one rather than a bug.
+
 ## The headline: O(N³) versus O(S)
 
 Carving `N x N` chunks (y fixed at 4), per-chunk work:
