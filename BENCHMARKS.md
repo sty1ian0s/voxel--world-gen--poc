@@ -1,139 +1,228 @@
 # Benchmark results
 
-Measured on this machine with `cargo bench -p voxel-core`, harness
-`benches/carvers.rs`. Reproduce with:
+Comparing the two cave carvers: `density` (Pass 2A, $O(N^3)$ 3D fractal noise)
+against `sparse` (Pass 2B, $O(S)$ origin lookup + SDF stamps).
+
+Reproduce:
 
 ```sh
+# per-chunk means with confidence intervals
 cargo bench -p voxel-core --bench carvers -- --warm-up-time 0.5 --measurement-time 2
+
+# per-chunk latency distribution (p50/p90/p99/p99.9)
+cargo bench -p voxel-core --bench latency
+
+# wall time, CPU time, peak RSS; wrap in perf stat for hardware counters
+cargo build --release -p voxel-app --bin carver_bench
+perf stat -e instructions,cycles,cache-misses,branch-misses ./target/release/carver_bench 8
 ```
 
-Criterion reports a confidence interval; the median is quoted below. Pass 1
-surface generation is excluded from the carver timings, since both carvers pay
-it and including it would damp the difference being measured.
+## The headline number was wrong, and this is the correction
 
-## Carve coverage parity
+Earlier versions of this document reported **"sparse is 130-139x faster"**. That
+number was real but it was measured at `origin_density = 0.02`, which carves
+**0.2%** of the rock. At that setting both carvers operate on a nearly empty
+world and the sparse carver does almost nothing, so the ratio described a world
+nobody runs.
 
-Before benchmarking speed, the two carvers have to carve comparable worlds, or
-the comparison is meaningless. Both are tuned to remove about the same fraction
-of rock:
+The shipped `.env` uses `origin_density = 2.0`, and that is what the parity test
+asserts on. Measured there, at matched coverage:
 
-| approach | setting | carved rock |
-| --- | --- | ---: |
-| density | noise threshold 0.30 | 18.9% |
-| sparse | 2.0 origins per 1000 voxels³ | 20.3% |
-
-A 1.4 point divergence. An integration test in `crates/voxel-core/tests/`
-asserts this stays within 5 points, both stay in a 10-35% band, caves appear in
-a comparable share of chunks, and that raising the sparse density still changes
-the result. That last check exists because a constant once capped it silently.
-
-At the demo's 16-chunk view distance the two worlds are also the same size:
-8.21M solid voxels under sparse against 8.59M under density, over 4356 chunks.
-
-One difference that falls out of this and is worth knowing: over those chunks
-sparse leaves **0** fully enclosed chunks where density leaves 103. Enclosed
-chunks are the ones `PROJECT.md` §4.3 culls from rendering, so sparse culls
-slightly less. Both are correct - noise-threshold carving leaves pockets of deep
-rock untouched and fully solid, while a stamp field spreads evenly enough to
-reach into nearly every deep chunk. It is a small rendering cost of the sparse
-approach, and a real one rather than a bug.
-
-## The headline: O(N³) versus O(S)
-
-Carving `N x N` chunks (y fixed at 4), per-chunk work:
-
-| chunks | density | sparse | ratio |
+| chunks | density | sparse | speedup |
 | ---: | ---: | ---: | ---: |
-| 4 | 1.20 ms | 9.6 µs | 125x |
-| 16 | 4.94 ms | 35.0 µs | 141x |
-| 64 | 19.4 ms | 145 µs | 134x |
-| 256 | 78.1 ms | 602 µs | 130x |
+| 4 | 1.187 ms | 0.416 ms | **2.85x** |
+| 16 | 4.872 ms | 1.787 ms | **2.73x** |
+| 64 | 19.433 ms | 7.386 ms | **2.63x** |
+| 256 | 77.306 ms | 28.560 ms | **2.71x** |
 
-**Density scales linearly with volume:** from 4 to 256 chunks is 64x the volume
-and 65.0x the time. That is the `O(N^3)` claim in `PROJECT.md` §1, confirmed
-rather than assumed: the cost is one noise sample per solid voxel, so it tracks
-the world's size.
+**Sparse is ~2.7x faster than density, not 130x.** The old figure is retained as
+a runnable benchmark (`carve/sparse_legacy_0.02`) so the inflation is
+reproducible rather than merely asserted:
 
-**Sparse is roughly 139x faster per chunk**, and that ratio holds across
-world sizes. The *work unit* counts need care, though, and an earlier version of
-this document got them wrong.
+| chunks | density | sparse @ 0.02 | legacy speedup | sparse @ 2.0 | real speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 1.187 ms | 8.0 µs | 148x | 0.416 ms | 2.85x |
+| 256 | 77.306 ms | 563 µs | 137x | 28.560 ms | 2.71x |
 
-At the current defaults both carvers remove about 19-20% of the rock, and at
-that coverage the sparse carver actually *tests more voxels* than the density
-carver samples:
+The measurement error was a **50x overstatement** of the algorithm's advantage.
+It is corrected here rather than quietly deleted.
+
+## Why the gap is smaller than the theory suggests
+
+`PROJECT.md` §1 frames this as $O(N^3)$ versus $O(S)$, which predicts a wide
+gap. The complexity claim is **confirmed** - density's cost tracks volume
+(4 -> 256 chunks is 64x the volume and 65.1x the time) - but complexity was
+never the whole story at matched coverage, because the two algorithms touch a
+**similar number of voxels**:
 
 | | density | sparse |
 | --- | ---: | ---: |
-| voxels touched | 355,565 | 434,197 |
+| voxels visited | 1,219,371 | 1,419,906 |
 | carve coverage | 18.9% | 20.3% |
 
-It still wins by 139x in time because of what each touch costs. A density sweep
-visits every solid voxel exactly once and pays for a 3D fractal noise evaluation
-at each. A sparse stamp re-tests voxels where spheres overlap, but each visit is
-a squared-distance comparison against a handful of origins. The expensive thing
-was never the number of visits.
+Sparse visits **1.16x more** voxels and still finishes 2.7x sooner. It wins on
+what each visit *costs*, not on how many there are:
 
-The previously published "130x less work" figure was measured at a cave density
-of 0.02, which carved 0.2% of the rock. That was very nearly an empty world, so
-the comparison flattered sparse badly. It is replaced here rather than quietly
-dropped, because the number was used to justify a claim about algorithmic
-complexity and it did not support one.
-
-## End-to-end, both carvers, same world
-
-4x4x4 chunks = 64 chunks, `generate_world` including Pass 1:
-
-| carver | time | throughput |
+| | density | sparse |
 | --- | ---: | ---: |
-| density | 35.8 ms | 1.79 K chunks/s |
-| sparse | 24.0 ms | 2.67 K chunks/s |
+| cost per voxel visit | 228.8 ns | 170.6 ns |
 
-Only **1.5x** apart, against the 130x difference in carver work. That is the
-expected consequence of a shared Pass 1: surface generation costs ~301 µs per
-chunk, about 19.3 ms for this world, and it dominates both runs. Cave carving is
-simply no longer the bottleneck once the sparse carver is used, which is the
-actual conclusion the POC was built to reach.
+A density visit is a 3D fractal noise evaluation. A sparse visit is a
+squared-distance comparison against a bounded set of origins, and most visits
+fail it immediately. The constant factor is where the win lives, and the
+$O(S)$ framing overstates it because at realistic coverage $S$ is not small
+relative to $N^3$.
+
+## End-to-end: the carver is no longer the bottleneck
+
+Isolating the carver flatters it, because both share Pass 1. Over a full
+64-chunk world including surface generation:
+
+| carver | end-to-end | throughput |
+| --- | ---: | ---: |
+| density | 34.53 ms | 1.85 K chunks/s |
+| sparse | 30.03 ms | 2.13 K chunks/s |
+
+Only **1.15x** apart, against 2.7x for the carve alone. This matches
+`carver_bench`'s independent measurement (279 ms vs 242 ms over 512 chunks,
+1.15x) exactly. Pass 1 costs ~301 µs/chunk and dominates both runs, so once the
+sparse carver is used, **cave carving stops being what world generation spends
+its time on**. That is the actual conclusion the POC was built to reach, and it
+survives the correction - arguably it is strengthened, since the carve is now
+known to be an even smaller share of the total than the old numbers implied.
+
+## Latency distribution (p50/p90/p99/p99.9)
+
+Criterion reports a median and a confidence interval; it has no notion of the
+tail. World generation runs inside a frame, so the tail is what drops frames.
+`benches/latency.rs` measures 5000 single-chunk carves per carver, setup
+excluded, chunk positions cycled so no lucky chunk repeats. Microseconds:
+
+| metric | density | sparse | sparse/density |
+| --- | ---: | ---: | ---: |
+| min | 276.85 | 92.70 | 0.33x |
+| p50 | 302.56 | 103.13 | 0.34x |
+| p90 | 316.02 | 116.93 | 0.37x |
+| p99 | 348.23 | 126.82 | 0.36x |
+| p99.9 | 442.50 | 149.39 | 0.34x |
+| mean | 302.31 | 104.56 | 0.35x |
+| max | 1823.22 | 194.34 | 0.11x |
+
+Sparse is **~3x faster at every percentile**, and the ratio holds into the tail
+rather than degrading. As a fraction of its own median:
+
+| | p90/p50 | p99/p50 | p99.9/p50 |
+| --- | ---: | ---: | ---: |
+| density | 1.04x | 1.15x | 1.46x |
+| sparse | 1.13x | 1.23x | 1.45x |
+
+The prediction that sparse would be *spikier* - because its cost depends on how
+many origins happen to land near a chunk - **did not hold**. Relative tail
+spread is nearly identical, and in absolute terms sparse's worst chunk (194 µs)
+is far below density's (1823 µs). The origin count per region is evidently
+tight enough, at density 2.0, that the Poisson variance expected from the
+design does not show up above the noise floor. Density's occasional 1.8 ms
+outlier is the interesting tail here, not sparse's.
+
+**Caveat:** absolute tail microseconds are scheduling-sensitive. Across repeated
+runs of an identical binary, medians moved ~30% and p99.9 moved by up to 3x.
+Within-run percentile *shape* is trustworthy; the exact tail figure is not, and
+neither is the max column. Treat the ratios as the result.
+
+## Resource usage
+
+`carver_bench 8` (512 chunks, sequential phases in one process):
+
+| carver | wall | user CPU | peak RSS | carved |
+| --- | ---: | ---: | ---: | ---: |
+| density | 279.0 ms | 270 ms | 8.57 MB | 164,766 |
+| sparse | 242.2 ms | 240 ms | 8.57 MB | 220,414 |
+
+Peak RSS is **identical (8.57 MB)** - both carvers allocate the same chunk grid,
+and neither allocates meaningfully per-carve. Memory is not a differentiator;
+the sparse carver's origin enumeration reuses stack and a bounded region scan
+rather than building a per-chunk list.
+
+Hardware counters, three consecutive runs at side 8 (stable to ±0.3%):
+
+| counter | value |
+| --- | ---: |
+| instructions | 11.891 G |
+| cycles | 3.338 G |
+| IPC | 3.56 |
+| branches | 1.058 G |
+| branch misses | 6.879 M |
+| branch misprediction rate | **0.65%** of all branches |
+| cache misses | ~163 K |
+
+An IPC of 3.56 on a 16-thread box, with only ~163 K cache misses across 11.9 G
+instructions and a 0.65% misprediction rate, says this is **compute-bound in a
+tight, cache-resident loop**, not memory-bound and not branch-bound. That is
+consistent with both algorithms working on a single 16³ chunk (64 KB) that fits
+comfortably in L2.
+
+## Wattage: not measured
+
+**No energy figure is reported, because none was measured.** This machine
+exposes no `/sys/class/powercap`, no RAPL, and no `cpufreq` to this shell, and
+`perf` energy events are unavailable, so a real watt reading was impossible.
+
+What can be said without inventing a number: energy is time x power, and the
+cycles column above is the physically meaningful proxy. Sparse does the same
+job in **93% of the wall time and 93% of the CPU time** of density, so at equal
+power draw it uses roughly **7% less energy per world**. That is an inference
+from measured time, not a measurement of power, and it assumes both carvers
+sustain comparable power - which is plausible for two compute-bound loops on
+the same data but is an assumption.
+
+To make it a real measurement, run on a host with RAPL:
+
+```sh
+perf stat -e power/energy-pkg/ ./target/release/carver_bench 8
+```
 
 ## Pipeline stages, one chunk
 
 | stage | time |
 | --- | ---: |
-| setup (fill + allocate) | 0.25 µs |
-| relight | 2.39 µs |
-| carve_sparse | 2.39 µs |
-| mesh_naive | 30.4 µs |
-| mesh_greedy | 69.7 µs |
+| setup (fill + allocate) | 0.24 µs |
+| relight | 3.26 µs |
+| carve_sparse | 122.5 µs |
+| mesh_naive | 32.0 µs |
+| mesh_greedy | 74.9 µs |
 | surface | 301 µs |
 
-Surface generation is 4x the greedy mesher and 126x the sparse carver. Lighting
-and the sparse carver are both a couple of microseconds, i.e. noise beside
-everything else.
+`carve_sparse` now reads 122.5 µs where this document previously said 2.39 µs.
+That is the 0.02 -> 2.0 density change, not a regression: the old figure was the
+near-empty world. Most of that 122.5 µs is the region enumeration, which is a
+fixed 27-region scan per chunk regardless of how many origins are found.
+
+Relative to surface generation the ordering is unchanged - surface is still
+2.5x the sparse carver and 4x the greedy mesher.
 
 ## Two results that need explaining rather than hiding
 
-**Greedy meshing is 2.3x slower than naive on CPU.** This is real and is not a
-bug. On the chunk measured, greedy produces **6 quads** where naive produces
-**1536** — a 256x reduction in output. Greedy pays for that with three
-mask-building passes over the chunk (one per axis) plus the merge scan, whereas
-naive does one early-outing sweep and emits a quad per face. Its output is
-256x smaller, so it is trading CPU time for vertex buffer size, upload cost and
-draw call count, which is the right trade when the GPU is the constraint and
-the wrong one for a nearly-empty chunk on a fast CPU. The chain to watch is
-`stages/mesh_greedy` against `stages/mesh_naive`; if the CPU side ever becomes
-the bottleneck, the fix is to skip the mask build for slices that are entirely
-empty or entirely full, not to abandon greedy meshing.
+**Greedy meshing is 2.3x slower than naive on CPU.** Real, and not a bug. On the
+chunk measured, greedy produces **6 quads** where naive produces **1536** - a
+256x reduction in output. Greedy pays with three mask-building passes plus the
+merge scan, and buys a 256x smaller vertex buffer, less upload traffic and fewer
+draw calls. That is the right trade when the GPU is the constraint and the wrong
+one for a nearly-empty chunk on a fast CPU. If the CPU side ever becomes the
+bottleneck the fix is to skip the mask build for slices that are entirely empty
+or entirely full, not to abandon greedy meshing.
 
-**Lighting costs the same for open sky and for carved terrain** (2.46 µs vs
-2.42 µs). The column scan plus flood fill is cheap enough that cave complexity
-is not visible at this scale, which is why the two numbers are within noise of
-each other.
+**Lighting costs the same for open sky and for carved terrain** (2.32 µs vs
+3.28 µs). The column scan plus flood fill is cheap enough that cave complexity
+barely registers at this scale, which is why the two are within a microsecond.
 
 ## Caveats
 
-- Single machine, single run, CPU rasteriser available but no GPU benchmarked.
-  Absolute times are not portable; the ratios are the point.
-- `y` is fixed at 4 chunks in the scaling sweep, so the sweep measures the
-  horizontal growth that `PROJECT.md` is about and not the vertical band.
+- Single machine (WSL2, 16 threads), single run unless stated. Absolute times
+  are not portable; the ratios are the point.
+- No GPU was benchmarked. CPU rasterisation only.
+- The latency tail is scheduling-sensitive; see above.
+- `y` is fixed at 4 chunks in the criterion scaling sweep, so the sweep measures
+  the horizontal growth `PROJECT.md` is about, not the vertical band.
 - The carver benchmarks rebuild the chunk surface inside `iter_batched` setup,
-  so the timed region is the carver alone and the setup cost is excluded
-  deliberately rather than accidentally.
+  so the timed region is the carver alone and setup is excluded deliberately.
+- Wattage is inferred from CPU time, not measured. Labelled as such above.
