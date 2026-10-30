@@ -22,9 +22,19 @@ use voxel_core::{Carver, Config, Env, RenderConfig, WorldSize};
 /// surface pass does not dominate at any size.
 const SIZES: [i32; 4] = [2, 4, 8, 16];
 
-fn cave_params() -> CaveParams {
+/// The density the shipped `.env` actually uses, and the one the parity test
+/// asserts on. A previous version of this bench used 0.02, which carved 0.2% of
+/// the rock; both carvers do far less work on a nearly-empty world, so the
+/// speedup that setting produced described a world nobody runs.
+const SPARSE_DENSITY: f32 = 2.0;
+
+/// The setting the original 130x figure was measured at, kept benchmarkable so
+/// the inflation is reproducible rather than merely asserted in the docs.
+const LEGACY_SPARSE_DENSITY: f32 = 0.02;
+
+fn cave_params(origin_density: f32) -> CaveParams {
     CaveParams {
-        origin_density: 0.02,
+        origin_density,
         min_radius: 1.5,
         max_radius: 4.0,
     }
@@ -47,7 +57,7 @@ fn prepared(side: i32, seed: u32) -> Vec<Chunk> {
 
 fn bench_carvers(c: &mut Criterion) {
     let seed = 1337u32;
-    let params = cave_params();
+    let params = cave_params(SPARSE_DENSITY);
 
     let mut group = c.benchmark_group("carve");
     // Re-running a carver over an already-carved chunk does strictly less work
@@ -83,6 +93,26 @@ fn bench_carvers(c: &mut Criterion) {
                 BatchSize::LargeInput,
             );
         });
+
+        // The old near-empty setting, kept so the doc's correction is backed by
+        // a runnable benchmark. Expect this to look far better than "sparse"
+        // above; that gap is the point.
+        let legacy = cave_params(LEGACY_SPARSE_DENSITY);
+        group.bench_with_input(
+            BenchmarkId::new("sparse_legacy_0.02", chunks),
+            &side,
+            |b, &side| {
+                b.iter_batched(
+                    || prepared(side, seed),
+                    |mut chunks| {
+                        for chunk in &mut chunks {
+                            black_box(sparse::carve(chunk, seed, &legacy));
+                        }
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();
@@ -100,7 +130,7 @@ fn bench_carver_comparison(c: &mut Criterion) {
             world: WorldSize { x: 4, y: 4, z: 4 },
             seed: 1337,
             carver,
-            cave: cave_params(),
+            cave: cave_params(SPARSE_DENSITY),
             validation: false,
             debug_views: false,
             frame_dump: false,
@@ -122,7 +152,7 @@ fn bench_carver_comparison(c: &mut Criterion) {
 /// rather than to "generation got slower".
 fn bench_pipeline_stages(c: &mut Criterion) {
     let seed = 1337u32;
-    let params = cave_params();
+    let params = cave_params(SPARSE_DENSITY);
     let hm = HeightMap::fitted_to_world(seed, 64);
     let pos = ChunkPos::new(0, 1, 0);
 
@@ -193,7 +223,7 @@ fn bench_pipeline_stages(c: &mut Criterion) {
 /// a regular grid, and so scales differently from the rest.
 fn bench_lighting(c: &mut Criterion) {
     let seed = 1337u32;
-    let params = cave_params();
+    let params = cave_params(SPARSE_DENSITY);
     let hm = HeightMap::fitted_to_world(seed, 64);
     let pos = ChunkPos::new(0, 1, 0);
 
