@@ -82,9 +82,13 @@ pub fn generate_surface(chunk: &mut Chunk, pos: ChunkPos, surface: &heightmap::H
     }
 }
 
-/// Recomputes the cull flags after generation.
+/// Light and flag a chunk once its terrain and caves are final.
+///
+/// Lighting runs after carving because a cave changes which voxels can see the
+/// sky; doing it first would leave every carved pocket fully lit.
 #[inline]
 pub fn finish(chunk: &mut Chunk) {
+    crate::light::relight_chunk(chunk);
     chunk.refresh_flags();
 }
 

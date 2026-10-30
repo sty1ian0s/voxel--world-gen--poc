@@ -8,6 +8,7 @@
 pub mod config;
 pub mod debug;
 pub mod domain;
+pub mod light;
 pub mod mesh;
 pub mod terrain;
 pub mod world;
@@ -20,5 +21,6 @@ pub use domain::{
 pub use terrain::density::CARVE_THRESHOLD;
 pub use terrain::heightmap::HeightMap;
 pub use terrain::sparse::{CaveOrigin, REGION_CHUNKS, REGION_SIZE, StampStats};
+pub use light::{Channel, relight_chunk, relight_grid};
 pub use mesh::{Direction, Mesh, Quad, mesh_chunk};
 pub use world::{Chunk, ChunkGrid, VoxelGroup};
