@@ -6,6 +6,9 @@
 
 pub mod app;
 pub mod camera;
+pub mod font;
 pub mod gpu;
+pub mod hud;
 pub mod logging;
 pub mod render;
+pub mod stats;

@@ -92,6 +92,15 @@ async fn run(cfg: Config, out: PathBuf) -> Result<()> {
     let camera = framing_camera(&cfg);
     renderer.set_view_projection(camera.view_projection());
 
+    // Draw the overlay too, so the captured frame proves the HUD pipeline
+    // works and not merely that the terrain does. The numbers are synthetic:
+    // this binary has no frame loop to measure.
+    let hud = sample_hud(&cfg, &stats, meshes.len(), vertices, grid.len());
+    renderer
+        .set_hud_lines(&hud)
+        .context("building the HUD overlay")?;
+    println!("hud        {} lines", hud.len());
+
     let (w, h, rgb) = renderer
         .render_to_rgb(wgpu::Color {
             r: SKY.0 as f64,
@@ -153,6 +162,49 @@ fn framing_camera(cfg: &Config) -> Camera {
     camera.far = (sx + sy + sz) * 6.0;
     camera.aspect = WIDTH as f32 / HEIGHT as f32;
     camera
+}
+
+/// Representative HUD lines, with plausible numbers.
+///
+/// A real frame loop supplies these from `FrameTimer`; here they are fixed so
+/// the captured image is reproducible and can be diffed.
+fn sample_hud(
+    cfg: &Config,
+    stats: &report::GenReport,
+    chunks_drawn: usize,
+    vertices: usize,
+    chunks_total: usize,
+) -> Vec<String> {
+    use voxel_app::hud::HudState;
+    use voxel_app::stats::FrameTimer;
+    use std::time::Duration;
+
+    // A synthetic window so the percentiles have something to show.
+    let mut timer = FrameTimer::new();
+    for i in 0..200 {
+        // Mostly 12ms with an occasional hitch, which is what a real run looks
+        // like and which makes the percentiles visibly different from p50.
+        let ms = if i % 37 == 0 { 28.0 } else { 12.0 + (i % 5) as f32 * 0.1 };
+        timer.record(Duration::from_secs_f32(ms / 1000.0));
+    }
+
+    HudState {
+        fps: 0.0,
+        frame: timer.stats(),
+        carver: cfg.carver,
+        chunks_drawn,
+        vertices,
+        chunks_total,
+        generation_ms: stats.elapsed.as_secs_f32() * 1000.0,
+        meshing_ms: 0.0,
+        camera_pos: [16.0, 70.0, 60.0],
+        yaw: 0.0,
+        pitch: -0.6,
+        world_size: (cfg.world.x, cfg.world.y, cfg.world.z),
+        seed: cfg.seed,
+        env: if cfg.env.is_dev() { "dev" } else { "prod" },
+    }
+    .lines()
 }
 
 fn write_ppm(path: &PathBuf, w: u32, h: u32, rgb: &[u8]) -> Result<()> {

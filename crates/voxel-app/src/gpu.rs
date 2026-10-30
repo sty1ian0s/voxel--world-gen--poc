@@ -70,6 +70,71 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Overlay shader: axis-aligned textured quads in clip space.
+///
+/// Vertices are already in normalised device coordinates and carry the texture
+/// coordinate, so this needs no matrices: the CPU side converts pixel
+/// coordinates to clip space when it builds the quads.
+const HUD_SHADER: &str = r#"
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    out.uv = in.uv;
+    return out;
+}
+
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Alpha is 1 everywhere in a HUD texture, so no blending is needed and the
+    // overlay can be drawn with blending disabled.
+    let c = textureSample(tex, samp, in.uv);
+    return vec4<f32>(c.rgb, 1.0);
+}
+"#;
+
+/// One screen-space vertex: clip-space position plus a texture coordinate.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HudVertex {
+    pub position: [f32; 2],
+    pub uv: [f32; 2],
+    /// Padding to a 16-byte stride.
+    pub _pad: [f32; 2],
+}
+
+impl HudVertex {
+    pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<HudVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x2,
+                offset: 8,
+                shader_location: 1,
+            },
+        ],
+    };
+}
+
 /// A chunk's GPU buffers plus how many vertices to draw.
 struct GpuChunk {
     vertex_buffer: wgpu::Buffer,
@@ -107,6 +172,35 @@ pub struct Renderer {
     origin_layout: wgpu::BindGroupLayout,
     chunks: Vec<GpuChunk>,
     depth_view: wgpu::TextureView,
+    /// Overlay pipeline and its state, built lazily on first use so a renderer
+    /// that never shows a HUD pays nothing for it.
+    hud: Option<Hud>,
+    /// Whether the HUD should be drawn.
+    pub hud_visible: bool,
+}
+
+/// The overlay pipeline plus the textures for the current frame's lines.
+struct Hud {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    vertex_buffer: wgpu::Buffer,
+    /// Capacity of `vertex_buffer` in vertices, so it is only reallocated when
+    /// a longer block of text needs more room.
+    capacity: usize,
+    /// Textures and bind groups for one frame, rebuilt when the lines change.
+    lines: Vec<HudLine>,
+}
+
+struct HudLine {
+    bind_group: wgpu::BindGroup,
+    /// Quad rect in physical pixels: x, y, width, height. Not read by the draw
+    /// path, which uses the pre-built vertices; kept because it is what a
+    /// click-through or a hit test would need, and it costs 16 bytes per line.
+    #[allow(dead_code)]
+    rect: [f32; 4],
+    vertex_count: u32,
+    vertex_offset: u32,
 }
 
 impl Renderer {
@@ -206,6 +300,8 @@ impl Renderer {
             origin_layout: built.origin_layout,
             chunks: Vec::new(),
             depth_view,
+            hud: None,
+            hud_visible: true,
         })
     }
 
@@ -303,7 +399,316 @@ impl Renderer {
             origin_layout: built.origin_layout,
             chunks: Vec::new(),
             depth_view,
+            hud: None,
+            hud_visible: true,
         })
+    }
+
+    /// Builds the overlay pipeline on first use.
+    ///
+    /// Free-standing rather than a method so it can be called while the
+    /// device, queue and `hud` field are all borrowed at once.
+    fn ensure_hud_parts(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> Result<Hud> {
+        {
+            let shader = device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("hud-shader"),
+                    source: wgpu::ShaderSource::Wgsl(HUD_SHADER.into()),
+                });
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("hud-texture-layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                            count: None,
+                        },
+                    ],
+                });
+
+            let pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("hud-pipeline-layout"),
+                        bind_group_layouts: &[Some(&layout)],
+                        immediate_size: 0,
+                    });
+
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("hud-pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[Some(HudVertex::LAYOUT)],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            // No blending: every HUD pixel is opaque, so the
+                            // overlay simply replaces what is underneath.
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        // The HUD is drawn as screen-space quads, so culling
+                        // would be a way to lose half of it for no benefit.
+                        cull_mode: None,
+                        unclipped_depth: false,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        conservative: false,
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        // The overlay must not write depth, or it would occlude
+                        // terrain drawn after it; `Always` puts it on top.
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(wgpu::CompareFunction::Always),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("hud-sampler"),
+                // Nearest, not linear: a scaled bitmap font must stay crisp.
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            });
+
+            let capacity = 4096;
+            let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hud-vertices"),
+                size: (capacity * std::mem::size_of::<HudVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            Ok(Hud {
+                pipeline,
+                layout,
+                sampler,
+                vertex_buffer,
+                capacity,
+                lines: Vec::new(),
+            })
+        }
+    }
+
+    /// Replaces the overlay with `lines`.
+    ///
+    /// Each line becomes its own texture and quad. One texture per line is more
+    /// uploads than a single atlas, but the HUD only rebuilds when its text
+    /// changes, so the cost is paid a handful of times per run rather than per
+    /// frame.
+    pub fn set_hud_lines(&mut self, lines: &[String]) -> Result<()> {
+        if lines.is_empty() || !self.hud_visible {
+            if let Some(hud) = self.hud.as_mut() {
+                hud.lines.clear();
+            }
+            return Ok(());
+        }
+
+        let scale = hud_scale(self.config.height);
+        let margin = 8.0 * scale as f32;
+        let line_step = (crate::font::ADVANCE_Y * scale) as f32;
+
+        // Every line is padded to the width of the longest one so the panel has
+        // a straight right edge, rather than each line carrying its own ragged
+        // background. Clamped to the window so a very long line cannot produce
+        // an oversized texture.
+        let panel_width = lines
+            .iter()
+            .map(|l| crate::font::text_size(l, scale).0)
+            .max()
+            .unwrap_or(0)
+            // Leave the right margin free too, so a long line is not clipped
+            // flush against the window edge.
+            .min(
+                self.config
+                    .width
+                    .saturating_sub(margin as u32 * 2)
+                    .max(1),
+            );
+
+        // Build every quad's vertices first so the buffer can be sized once.
+        let mut vertices: Vec<HudVertex> = Vec::new();
+        let mut rects: Vec<([f32; 4], u32, u32)> = Vec::new();
+        let mut textures: Vec<crate::font::TextTexture> = Vec::new();
+
+        let mut y = margin;
+        for line in lines {
+            if line.is_empty() {
+                // A blank line still advances, which is what separates groups.
+                y += line_step;
+                continue;
+            }
+            let tex = crate::font::render_text_padded(
+                line,
+                scale,
+                crate::font::HUD_FG,
+                crate::font::HUD_BG,
+                panel_width,
+            );
+            if tex.width == 0 || tex.height == 0 {
+                y += line_step;
+                continue;
+            }
+
+            let offset = vertices.len() as u32;
+            push_quad(
+                &mut vertices,
+                [margin, y, tex.width as f32, tex.height as f32],
+                [self.config.width as f32, self.config.height as f32],
+            );
+            rects.push((
+                [margin, y, tex.width as f32, tex.height as f32],
+                offset,
+                6,
+            ));
+            textures.push(tex);
+            y += line_step;
+        }
+
+        if vertices.is_empty() {
+            if let Some(hud) = self.hud.as_mut() {
+                hud.lines.clear();
+            }
+            return Ok(());
+        }
+
+        // Built once, on the first HUD update, and kept for the renderer's
+        // lifetime so later updates only rewrite buffers and textures.
+        if self.hud.is_none() {
+            let built = Self::ensure_hud_parts(&self.device, self.config.format)?;
+            self.hud = Some(built);
+        }
+
+        let device = &self.device;
+        let queue = &self.queue;
+        let hud = self.hud.as_mut().expect("hud was just built");
+
+        // Grow the vertex buffer only when the new content does not fit.
+        if vertices.len() > hud.capacity {
+            hud.capacity = vertices.len().next_power_of_two();
+            hud.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hud-vertices"),
+                size: (hud.capacity * std::mem::size_of::<HudVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+
+        queue.write_buffer(&hud.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+        // Upload one texture per line.
+        hud.lines.clear();
+        for (tex, (rect, offset, count)) in textures.iter().zip(rects) {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("hud-line"),
+                size: wgpu::Extent3d {
+                    width: tex.width,
+                    height: tex.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &tex.pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    // Tightly packed; the font buffer has no row padding.
+                    bytes_per_row: Some(tex.width * 4),
+                    rows_per_image: Some(tex.height),
+                },
+                wgpu::Extent3d {
+                    width: tex.width,
+                    height: tex.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hud-line-bind-group"),
+                layout: &hud.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&hud.sampler),
+                    },
+                ],
+            });
+
+            hud.lines.push(HudLine {
+                bind_group,
+                rect,
+                vertex_count: count,
+                vertex_offset: offset,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Records the overlay pass. Assumes `set_hud_lines` has run.
+    fn encode_hud(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let Some(hud) = self.hud.as_ref() else {
+            return;
+        };
+        if hud.lines.is_empty() || !self.hud_visible {
+            return;
+        }
+
+        pass.set_pipeline(&hud.pipeline);
+        pass.set_vertex_buffer(0, hud.vertex_buffer.slice(..));
+        for line in &hud.lines {
+            pass.set_bind_group(0, &line.bind_group, &[]);
+            pass.draw(
+                line.vertex_offset..line.vertex_offset + line.vertex_count,
+                0..1,
+            );
+        }
     }
 
     /// Records the render pass shared by the surface and offscreen paths.
@@ -347,6 +752,10 @@ impl Renderer {
             pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
             pass.draw(0..chunk.vertex_count, 0..1);
         }
+
+        // The overlay goes in the same pass, after the terrain, so it needs no
+        // second encoder and lands on top by draw order alone.
+        self.encode_hud(&mut pass);
     }
 
     /// Draws one frame offscreen and returns it as RGB bytes.
@@ -662,6 +1071,62 @@ fn build_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> Result<
         camera_bind_group,
         origin_layout,
     })
+}
+
+/// Integer font scale for a given framebuffer height.
+///
+/// Integer only, because a fractional scale on a bitmap font turns crisp pixels
+/// into uneven mush. A 5x7 glyph at scale 2 is comfortably readable at 720p.
+pub const fn hud_scale(height: u32) -> u32 {
+    if height >= 1440 {
+        3
+    } else if height >= 720 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Appends a screen-space quad as two triangles, converting pixels to clip space.
+///
+/// Pixel coordinates are top-left origin, which is how the HUD is laid out;
+/// clip space is `-1..1` with Y pointing up, so Y is flipped here rather than
+/// at every call site.
+fn push_quad(out: &mut Vec<HudVertex>, rect: [f32; 4], screen: [f32; 2]) {
+    let [x, y, w, h] = rect;
+    let to_clip = |px: f32, py: f32| -> [f32; 2] {
+        [
+            px / screen[0] * 2.0 - 1.0,
+            // Flip: pixel Y grows downward, clip Y grows upward.
+            1.0 - py / screen[1] * 2.0,
+        ]
+    };
+
+    let tl = to_clip(x, y);
+    let tr = to_clip(x + w, y);
+    let br = to_clip(x + w, y + h);
+    let bl = to_clip(x, y + h);
+
+    // UVs: V is flipped so the texture's first row is the quad's top row.
+    let uv_tl = [0.0, 0.0];
+    let uv_tr = [1.0, 0.0];
+    let uv_br = [1.0, 1.0];
+    let uv_bl = [0.0, 1.0];
+
+    let v = |position: [f32; 2], uv: [f32; 2]| HudVertex {
+        position,
+        uv,
+        _pad: [0.0; 2],
+    };
+
+    // Triangle 1.
+    out.push(v(tl, uv_tl));
+    out.push(v(tr, uv_tr));
+    out.push(v(br, uv_br));
+    // Triangle 2.
+    out.push(v(tl, uv_tl));
+    out.push(v(br, uv_br));
+    out.push(v(bl, uv_bl));
 }
 
 /// Rounds a row length up to wgpu's 256-byte alignment requirement for texture

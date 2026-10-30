@@ -18,11 +18,13 @@ use winit::window::{Window, WindowId};
 
 use voxel_core::debug::report;
 use voxel_core::mesh::mesh_chunk;
-use voxel_core::{ChunkGrid, ChunkPos, Config};
+use voxel_core::{Carver, ChunkGrid, ChunkPos, Config};
 
 use crate::camera::Camera;
 use crate::gpu::{FrameOutcome, Renderer};
+use crate::hud::{CarverSwitch, HudState};
 use crate::render::ChunkMeshData;
+use crate::stats::FrameTimer;
 
 /// Sky colour, used as the clear colour and as the ambient against which the
 /// terrain's shading reads.
@@ -59,10 +61,16 @@ struct App {
     /// key-repeat.
     keys: Vec<KeyCode>,
     last_frame: Instant,
+    /// Rolling frame-time window backing the HUD's percentiles.
+    timer: FrameTimer,
+    /// Carver selection, including any pending switch.
+    carver: CarverSwitch,
+    /// Counters used to decide when the HUD text actually changes, so the
+    /// overlay is not rebuilt and re-uploaded every single frame.
+    last_hud: Option<String>,
+    /// Wall-clock accumulators for the logging summary.
     frames: u64,
     fps_timer: Instant,
-    /// Set once the world is generated, so the one-off cost is reported once.
-    reported_generation: bool,
 }
 
 impl App {
@@ -72,9 +80,11 @@ impl App {
             state: None,
             keys: Vec::new(),
             last_frame: Instant::now(),
+            timer: FrameTimer::new(),
+            carver: CarverSwitch::new(cfg.carver),
+            last_hud: None,
             frames: 0,
             fps_timer: Instant::now(),
-            reported_generation: false,
         }
     }
 }
@@ -86,6 +96,13 @@ struct State {
     camera: Camera,
     uploaded_chunks: usize,
     uploaded_vertices: usize,
+    /// The generated world, kept so a carver switch can regenerate without
+    /// re-reading config.
+    grid: ChunkGrid,
+    /// Chunks the cull flags kept, for the HUD's drawn/total ratio.
+    chunks_total: usize,
+    generation_ms: f32,
+    meshing_ms: f32,
 }
 
 impl ApplicationHandler for App {
@@ -155,33 +172,32 @@ impl ApplicationHandler for App {
             log::warn!("using a software rasteriser; frame timings are not representative");
         }
 
-        // Generate the world once, then mesh and upload it.
-        let (grid, stats) = report::generate_world(&self.cfg);
-        let meshes = mesh_grid(&grid, &self.cfg);
-        let vec_total: usize = meshes.iter().map(|m| m.vertex_count()).sum();
-
+        // Generate, mesh and upload once at startup.
         let mut renderer = renderer;
-        renderer.upload_chunks(&meshes);
-
-        let camera = default_camera(&self.cfg, &grid);
+        let camera = default_camera(&self.cfg, &ChunkGrid::new(
+            self.cfg.world.x,
+            self.cfg.world.y,
+            self.cfg.world.z,
+        ));
+        let built = build_world(&mut renderer, &self.cfg);
 
         log::warn!(
             "world ready: {} chunks meshed, {} vertices uploaded",
-            renderer.uploaded_chunks(),
-            vec_total
+            built.chunks_drawn, built.vertices
         );
-        // The generation report is logged rather than drawn as an overlay:
-        // an overlay needs a text renderer, which is a font atlas and a second
-        // pipeline, and the numbers are just as readable in the log.
-        log::warn!("generation: {}", report::format(&self.cfg, &stats).replace('\n', " | "));
+        log::warn!("generation: {}", built.report_line);
+
         self.state = Some(State {
             window,
             renderer,
             camera,
-            uploaded_chunks: meshes.len(),
-            uploaded_vertices: vec_total,
+            uploaded_chunks: built.chunks_drawn,
+            uploaded_vertices: built.vertices,
+            grid: built.grid,
+            chunks_total: built.chunks_total,
+            generation_ms: built.generation_ms,
+            meshing_ms: built.meshing_ms,
         });
-        self.reported_generation = true;
         self.last_frame = Instant::now();
     }
 
@@ -214,9 +230,35 @@ impl ApplicationHandler for App {
                 ..
             } => match key_state {
                 ElementState::Pressed => {
-                    if code == KeyCode::Escape {
-                        event_loop.exit();
-                        return;
+                    match code {
+                        KeyCode::Escape => {
+                            event_loop.exit();
+                            return;
+                        }
+                        // Toggle the overlay, for an unobstructed look at the
+                        // terrain without restarting.
+                        KeyCode::KeyH => {
+                            state.renderer.hud_visible = !state.renderer.hud_visible;
+                            // Force a rebuild so the change takes effect even if
+                            // the text itself did not change.
+                            self.last_hud = None;
+                            log::info!("HUD {}", if state.renderer.hud_visible { "on" } else { "off" });
+                        }
+                        // Switch carver and regenerate. The actual work happens
+                        // at the top of the next frame, not here, so input
+                        // handling never blocks on generation.
+                        KeyCode::KeyC => {
+                            self.carver.toggle();
+                            log::info!("carver switch queued");
+                        }
+                        // Reset the frame-time window, to measure a specific
+                        // moment rather than a lifetime average.
+                        KeyCode::KeyR => {
+                            self.timer.reset();
+                            self.last_hud = None;
+                            log::info!("frame-time statistics reset");
+                        }
+                        _ => {}
                     }
                     if !self.keys.contains(&code) {
                         self.keys.push(code);
@@ -226,16 +268,50 @@ impl ApplicationHandler for App {
             },
 
             WindowEvent::RedrawRequested => {
-                let dt = self.last_frame.elapsed().as_secs_f32();
+                let frame_time = self.last_frame.elapsed();
                 self.last_frame = Instant::now();
+                self.timer.record(frame_time);
                 // Clamp so a stall (a breakpoint, a suspended laptop) does not
                 // teleport the camera across the world on the next frame.
-                let dt = dt.min(0.1);
+                let dt = frame_time.as_secs_f32().min(0.1);
+
+                // A pending carver switch regenerates before anything is drawn,
+                // so the frame shows one consistent world rather than a mix.
+                if let Some(carver) = self.carver.take() {
+                    self.cfg.carver = carver;
+                    log::warn!("switching carver to {carver}, regenerating world");
+                    let built = build_world(&mut state.renderer, &self.cfg);
+                    state.grid = built.grid;
+                    state.chunks_total = built.chunks_total;
+                    state.generation_ms = built.generation_ms;
+                    state.meshing_ms = built.meshing_ms;
+                    state.uploaded_chunks = built.chunks_drawn;
+                    state.uploaded_vertices = built.vertices;
+                    // The old world's frame times say nothing about the new
+                    // one, so the window starts clean rather than blending the
+                    // two carvers together in the percentiles.
+                    self.timer.reset();
+                    // The basic requirement for side-by-side comparison is to
+                    // keep looking at the same place, which means the camera
+                    // deliberately survives the switch.
+                    log::warn!("carver {carver}: {}", built.report_line);
+                }
 
                 apply_input(state, &self.keys, dt);
 
                 let view_projection = state.camera.view_projection();
                 state.renderer.set_view_projection(view_projection);
+
+                // Rebuild the overlay only when its text changes: the
+                // percentiles move slowly, and re-uploading a texture per line
+                // every frame would itself cost more than the HUD is worth.
+                update_hud(
+                    &mut self.timer,
+                    &mut self.last_hud,
+                    self.carver.current(),
+                    &self.cfg,
+                    state,
+                );
 
                 match state.renderer.render(SKY) {
                     Ok(()) => {}
@@ -248,15 +324,14 @@ impl ApplicationHandler for App {
 
                 self.frames += 1;
                 if self.fps_timer.elapsed().as_secs_f32() >= 2.0 {
-                    let fps = self.frames as f32 / self.fps_timer.elapsed().as_secs_f32();
-                    log::info!(
-                        "{fps:.0} fps, {} chunks, {} vertices, camera ({:.0}, {:.0}, {:.0})",
-                        state.uploaded_chunks,
-                        state.uploaded_vertices,
-                        state.camera.eye[0],
-                        state.camera.eye[1],
-                        state.camera.eye[2],
-                    );
+                    if let Some(s) = self.timer.stats() {
+                        log::info!(
+                            "{} | {} chunks, {} vertices",
+                            s.summary(),
+                            state.uploaded_chunks,
+                            state.uploaded_vertices
+                        );
+                    }
                     self.frames = 0;
                     self.fps_timer = Instant::now();
                 }
@@ -278,6 +353,90 @@ impl ApplicationHandler for App {
             state.window.request_redraw();
         }
     }
+}
+
+/// What a completed world build produced.
+struct BuiltWorld {
+    grid: ChunkGrid,
+    chunks_total: usize,
+    chunks_drawn: usize,
+    vertices: usize,
+    generation_ms: f32,
+    meshing_ms: f32,
+    /// The generation counter line, reused for both the log and the HUD.
+    report_line: String,
+}
+
+/// Generates, meshes and uploads a world for the configured carver.
+///
+/// Shared by startup and by the carver switch, so the two paths cannot drift:
+/// whatever the switch does is exactly what startup does.
+fn build_world(renderer: &mut Renderer, cfg: &Config) -> BuiltWorld {
+    let t0 = Instant::now();
+    let (grid, stats) = report::generate_world(cfg);
+    let generation_ms = t0.elapsed().as_secs_f32() * 1000.0;
+
+    let t1 = Instant::now();
+    let meshes = mesh_grid(&grid, cfg);
+    let meshing_ms = t1.elapsed().as_secs_f32() * 1000.0;
+
+    let vertices: usize = meshes.iter().map(|m| m.vertex_count()).sum();
+    renderer.upload_chunks(&meshes);
+
+    BuiltWorld {
+        chunks_total: grid.len(),
+        chunks_drawn: meshes.len(),
+        vertices,
+        generation_ms,
+        meshing_ms,
+        report_line: report::format(cfg, &stats).replace('\n', " | "),
+        grid,
+    }
+}
+
+/// Rebuilds the overlay if its content changed.
+///
+/// Takes the individual pieces rather than `&mut App`, because the caller is
+/// already holding a mutable borrow of `App::state` at the point this runs.
+fn update_hud(
+    timer: &mut FrameTimer,
+    last_hud: &mut Option<String>,
+    carver: Carver,
+    cfg: &Config,
+    state: &mut State,
+) {
+    // `stats()` needs a mutable borrow, so it is taken once and reused.
+    let stats = timer.stats();
+    let hud = HudState {
+        fps: stats.map_or(0.0, |s| s.fps()),
+        frame: stats,
+        carver,
+        chunks_drawn: state.uploaded_chunks,
+        vertices: state.uploaded_vertices,
+        chunks_total: state.chunks_total,
+        generation_ms: state.generation_ms,
+        meshing_ms: state.meshing_ms,
+        camera_pos: state.camera.eye,
+        yaw: state.camera.yaw,
+        pitch: state.camera.pitch,
+        world_size: (cfg.world.x, cfg.world.y, cfg.world.z),
+        seed: cfg.seed,
+        env: if cfg.env.is_dev() { "dev" } else { "prod" },
+    };
+    let lines = hud.lines();
+
+    // The HUD is only rebuilt when the rendered text differs. Frame times are
+    // rounded to two decimals by the formatter, so a steady frame rate settles
+    // into a stable string and the upload happens rarely rather than per frame.
+    let key = lines.join("\n");
+    if last_hud.as_deref() == Some(key.as_str()) {
+        return;
+    }
+    if let Err(e) = state.renderer.set_hud_lines(&lines) {
+        log::error!("could not update the HUD: {e:#}");
+        return;
+    }
+    *last_hud = Some(key);
 }
 
 /// WASD to move, arrows to look, Space/Shift for vertical.
