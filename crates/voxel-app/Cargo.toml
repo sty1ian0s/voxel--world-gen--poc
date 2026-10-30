@@ -6,6 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 description = "wgpu + winit front end for the voxel world-gen POC."
 
+[[bin]]
+name = "carver_bench"
+path = "src/bin/carver_bench.rs"
+
 [dependencies]
 voxel-core.workspace = true
 
