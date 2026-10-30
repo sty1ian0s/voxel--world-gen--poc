@@ -21,8 +21,8 @@ pub struct HeightMap {
 }
 
 impl HeightMap {
-    /// Base height 64, amplitude 24, sea level 62 — values chosen so that the
-    /// default config's shallow worlds still straddle water and land.
+    /// Base height 64, amplitude 24. Use [`WorldFit`] to place the terrain
+    /// inside a world box that does not reach that high.
     pub const fn new(seed: u32, sea_level: i32) -> Self {
         Self {
             seed,
@@ -30,6 +30,34 @@ impl HeightMap {
             base: 64.0,
             amplitude: 24.0,
         }
+    }
+
+    /// Terrain sized to fit a world that is `world_height` voxels tall.
+    ///
+    /// Without this a short world (the 4-chunk default is 64 voxels) sits
+    /// entirely *below* the surface, so every chunk generates as solid stone
+    /// with no caves, no water and no sky. Deriving the band from the world
+    /// height keeps the default config showing real terrain.
+    pub fn fitted_to_world(seed: u32, world_height: u32) -> Self {
+        let h = world_height as f32;
+        // Leave a quarter of the box as sky so the surface is visible, and
+        // scale the amplitude to the available room.
+        let base = h * 0.55;
+        let amplitude = h * 0.18;
+        Self {
+            seed,
+            sea_level: (h * 0.5) as i32,
+            base,
+            amplitude,
+        }
+    }
+
+    pub const fn base(&self) -> f32 {
+        self.base
+    }
+
+    pub const fn amplitude(&self) -> f32 {
+        self.amplitude
     }
 
     pub const fn with_sea_level(seed: u32, sea_level: i32) -> Self {

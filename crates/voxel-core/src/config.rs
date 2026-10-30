@@ -184,17 +184,35 @@ impl Config {
         // is not, but dotenvy only reports syntax problems, which we ignore
         // rather than refusing to boot on a stray comment.
         //
-        // Every layer uses the `_override` form: plain `from_filename` never
-        // overwrites a variable that is already set, so `.env.prod` would be
-        // silently ignored whenever the shell exported `APP_ENV=prod`.
+        // Two constraints pull against each other here:
+        //   * `.env.prod` must be able to override `.env`, which plain
+        //     `from_filename` will not do because it refuses to touch an
+        //     already-set variable.
+        //   * the real process environment must still beat every file, so
+        //     `VOXEL_WORLD_X=64 cargo run` behaves as typed.
+        //
+        // So the real environment is snapshotted first, the files are applied
+        // with `_override` (which lets later files win), and the snapshot is
+        // then written back on top. That gets both orderings right, which
+        // neither plain nor `_override` loading does on its own.
+        let process_env: Vec<(String, String)> = std::env::vars()
+            .filter(|(k, _)| k.starts_with("VOXEL_") || k == "APP_ENV" || k == "RUST_LOG")
+            .collect();
+
         let _ = dotenvy::from_filename_override(".env");
         if env.is_prod() {
             let _ = dotenvy::from_filename_override(".env.prod");
         }
         let _ = dotenvy::from_filename_override(".env.local");
 
-        // Process env wins last, so `APP_ENV=prod cargo run` behaves as written
-        // even when .env says dev.
+        for (k, v) in &process_env {
+            // SAFETY: config is loaded once at startup, before any threads that
+            // read the environment exist.
+            unsafe { std::env::set_var(k, v) };
+        }
+
+        // `APP_ENV` is re-read so a shell override still selects the overlay it
+        // was asked for, even though the files have now been applied.
         let env = raw("APP_ENV").map_or(Ok(env), |v| Env::from_str(&v))?;
 
         let world = WorldSize {

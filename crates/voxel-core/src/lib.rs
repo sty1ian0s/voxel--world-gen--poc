@@ -6,6 +6,7 @@
 //! testable and benchmarkable without a GPU or a window.
 
 pub mod config;
+pub mod debug;
 pub mod domain;
 pub mod terrain;
 pub mod world;
