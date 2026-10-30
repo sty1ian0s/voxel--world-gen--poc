@@ -19,7 +19,7 @@ See [`PROJECT.md`](PROJECT.md) for the original architecture and
 | Chunk storage + cull flags | done |
 | Pass 1 heightmap | done |
 | Pass 2A density carver | done, `O(N³)` confirmed by measurement |
-| Pass 2B sparse carver | done, 130x less work per chunk |
+| Pass 2B sparse carver | done, 2.7x faster per chunk at matched coverage |
 | Debug views (ASCII, PPM/PGM, counters) | done, verified by eye |
 | Greedy mesher + naive baseline | done, 256x fewer quads |
 | Lighting (sunlight + block light) | done |
@@ -127,7 +127,12 @@ lifetime average, and `H` to get the overlay out of the way.
 cargo test --workspace
 cargo run -p voxel-app --bin debug -- --world 4,4,4 --compare --slice 48
 cargo run -p voxel-app --bin voxel-app
+
+# Benchmarks: means, then the tail, then resources.
 cargo bench -p voxel-core --bench carvers
+cargo bench -p voxel-core --bench latency
+cargo build --release -p voxel-app --bin carver_bench
+perf stat -e instructions,cycles,branches,branch-misses ./target/release/carver_bench 8
 ```
 
 ## Environment
