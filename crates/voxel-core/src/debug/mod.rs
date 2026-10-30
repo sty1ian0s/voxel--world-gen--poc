@@ -11,8 +11,11 @@
 //! * [`ascii`] — one slice, one character per voxel, small enough to read.
 //! * [`image`] — PNG-free PGM/PPM cross-sections, for eyeballing large areas.
 //! * [`report`] — counters that make the `O(N^3)` vs `O(S)` claim auditable.
+//! * [`caves`] — cave *shape* statistics, for judging MC-likeness rather than
+//!   mere coverage. Coverage parity cannot tell tunnels from spheres.
 
 pub mod ascii;
+pub mod caves;
 pub mod image;
 pub mod report;
 
