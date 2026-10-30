@@ -11,3 +11,6 @@
 
 # Workspace-local CARGO_HOME used when ~/.cargo is not writable.
 /.cargo-home/
+
+# Crate-local target dirs (created by tests writing artefacts).
+crates/*/target/

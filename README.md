@@ -24,6 +24,7 @@ See [`PROJECT.md`](PROJECT.md) for the original architecture and
 | Greedy mesher + naive baseline | done, 256x fewer quads |
 | Lighting (sunlight + block light) | done |
 | Culling (frustum, flags, distance) | done |
+| Debug HUD (fps, frame-time percentiles, live carver switch) | done, verified via software raster |
 | wgpu + winit app | **compiles; not executed — see below** |
 | Criterion benchmarks | done, results committed |
 
@@ -40,6 +41,48 @@ but no frame has been observed. Run this on a machine with a real GPU:
 cargo run -p voxel-app --bin voxel-app            # window
 cargo run -p voxel-app --bin offscreen            # one frame to a PPM
 ```
+
+The HUD cannot be seen here either, so it is verified a different way: a
+software rasteriser test in `crates/voxel-app/src/hud.rs` composites the same
+quads and pixels the GPU path builds and writes `debug-out/hud-overlay.ppm`.
+That image caught two real defects the unit tests could not: every line was
+carrying its own ragged background, and the key-hint line was clipped at the
+window edge.
+
+## Controls
+
+| Key | Action |
+| --- | --- |
+| `W` `A` `S` `D` | Move |
+| Arrows | Look (yaw / pitch) |
+| `Space` / `Shift` | Rise / descend |
+| `C` | **Switch carver** (`density` ↔ `sparse`) and regenerate |
+| `H` | Toggle the HUD |
+| `R` | Reset the frame-time statistics |
+| `Esc` | Quit |
+
+Keyboard-only on purpose: pointer capture does not work over a remote session,
+where verification actually happens.
+
+### The debug HUD
+
+![HUD](docs/images/hud.png)
+
+Top-left overlay, drawn as text quads with a built-in 5x7 bitmap font:
+
+- **`fps`** derived from the median frame time, not the mean. A single 200 ms
+  hitch drags a mean down and makes a healthy run look broken.
+- **`p50 / p90 / p99 / p99.9 / min / max`** from a rolling 600-frame window
+  (ten seconds at 60 fps). This is the point of the HUD: the mean hides exactly
+  the stutter that matters. In the image above, p50 is 12.2 ms while p99 is
+  28 ms — the occasional long frame is visible in the tail and invisible in the
+  median, which is how it feels to play.
+- **`carver`**, `chunks drawn/total`, `verts`, world size and seed.
+- **`gen`**: world generation plus meshing time for the current world.
+- Camera position and look angles.
+
+Press `R` before a measurement so you are reading that moment rather than a
+lifetime average, and `H` to get the overlay out of the way.
 
 ## Quick start
 

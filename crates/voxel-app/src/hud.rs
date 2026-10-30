@@ -461,7 +461,10 @@ mod raster_tests {
             .count();
         assert!(sky_pixels > 1000, "overlay filled the whole frame");
 
-        let path = std::path::Path::new("debug-out/hud-overlay.ppm");
+        // Written under `target/`, which is always ignored, so a test run never
+        // dirties the working tree. The version referenced by the README lives
+        // in `docs/images/` and is copied there deliberately.
+        let path = std::path::Path::new("target/hud-overlay.ppm");
         write_ppm(path, w, h, &rgb);
         assert!(path.exists(), "the HUD image was not written");
     }
