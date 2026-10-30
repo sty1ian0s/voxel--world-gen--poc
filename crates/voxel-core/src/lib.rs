@@ -6,5 +6,10 @@
 //! testable and benchmarkable without a GPU or a window.
 
 pub mod config;
+pub mod domain;
 
 pub use config::{Carver, CaveParams, Config, ConfigError, Env, RenderConfig, WorldSize};
+pub use domain::{
+    BlockId, CHUNK_SHIFT, CHUNK_SIZE, CHUNK_VOLUME, ChunkPos, LightLevel, LocalPos, PackedVoxel,
+    VoxelIndex,
+};
