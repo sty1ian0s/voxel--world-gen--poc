@@ -161,6 +161,44 @@ tight, cache-resident loop**, not memory-bound and not branch-bound. That is
 consistent with both algorithms working on a single 16³ chunk (64 KB) that fits
 comfortably in L2.
 
+## Downstream effects: what carving changes for culling and meshing
+
+The carvers do not only differ in speed. They leave the world in different
+states, and those states are what the *next* stage pays for. Measured over the
+same world at three sizes (`carver_bench`'s per-chunk flags):
+
+| world | carver | empty chunks | **enclosed chunks** |
+| --- | --- | ---: | ---: |
+| 4x4x4 | density | 16 | 0 |
+| 4x4x4 | sparse | 16 | 0 |
+| 8x8x8 | density | 185 | **10** |
+| 8x8x8 | sparse | 181 | **0** |
+| 12x12x12 | density | 629 | **38** |
+| 12x12x12 | sparse | 629 | **0** |
+
+`empty` (all air) and `enclosed` (all solid) are the two cheap culls
+`cull::CullStats` performs with a single bool read before any geometry work, so
+an enclosed chunk is a chunk the mesher and renderer skip entirely.
+
+**Sparse leaves zero enclosed chunks at every size.** Density leaves 38 at
+12x12x12. This is a real, measurable rendering cost of the sparse approach: it
+is faster to carve and slightly more expensive downstream. It is not a bug.
+Noise-threshold carving leaves deep rock pockets untouched and fully solid,
+whereas a stamp field spreads evenly enough to breach nearly every deep chunk.
+The flag is set correctly in both cases; the worlds genuinely differ.
+
+The practical reading: sparse trades **~2.7x carve time** against **a handful of
+extra chunks that must be meshed and drawn**. At 38 chunks out of 1728 (2.2%)
+that is a small downstream cost against a large upstream win, but it is a real
+one and it grows with world size. A hybrid - sparse carve plus a cheap
+enclosure sweep that re-solidifies surviving pockets - would recover both, and
+is the obvious next step if the downstream cost ever matters.
+
+The mesher side of the same question is already measured: greedy meshing emits
+**6 quads** where naive emits **1536** on a typical chunk, a 256x reduction.
+That difference dwarfs the 2.2% chunk-count effect here, which is why the
+enclosed-chunk gap is worth recording but not worth optimising yet.
+
 ## Wattage: not measured
 
 **No energy figure is reported, because none was measured.** This machine
@@ -175,11 +213,22 @@ from measured time, not a measurement of power, and it assumes both carvers
 sustain comparable power - which is plausible for two compute-bound loops on
 the same data but is an assumption.
 
-To make it a real measurement, run on a host with RAPL:
+To make it a real measurement you need a host whose kernel exposes a power PMU.
+This one does not: `perf list` shows no `power`/`energy`/`rapl` event at all, so
+the obvious command fails outright rather than reporting zero:
 
 ```sh
-perf stat -e power/energy-pkg/ ./target/release/carver_bench 8
+# On this box (WSL2, kernel 6.18.54.1-microsoft-standard-WSL2):
+$ perf stat -e power/energy-pkg/ ./target/release/carver_bench 8
+event syntax error: 'power/energy-pkg/'
+                     \___ Bad event or PMU
+Unable to find PMU or event on a PMU of 'power'
 ```
+
+On bare-metal Linux with `CONFIG_INTEL_RAPL` (or the AMD equivalent) and
+`/sys/class/powercap` present, that same command works and `perf stat -e
+power/energy-pkg/` becomes a real reading. Check first with `perf list | grep -i
+energy`; if that is empty, no command will produce a watt figure.
 
 ## Pipeline stages, one chunk
 
