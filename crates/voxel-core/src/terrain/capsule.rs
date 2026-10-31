@@ -249,6 +249,7 @@ fn stamp_tunnel(
     fields: &Fields,
     start_x: f32,
     start_z: f32,
+    base_radius: f32,
 ) -> u64 {
     let mut touched = 0u64;
 
@@ -260,7 +261,7 @@ fn stamp_tunnel(
         return 0;
     }
 
-    let radius = RADIUS * (0.75 + 0.5 * placement.abs());
+    let radius = base_radius * (0.75 + 0.5 * placement.abs());
     // The entry heading is the direction field at the seed, so the tunnel
     // leaves in a direction the field chose rather than one chosen for it.
     let mut heading = direction * std::f32::consts::PI;
@@ -374,6 +375,16 @@ const SEARCH_CELLS: i32 = TUNNEL_LENGTH / SEED_GRID + 1;
 /// Returns the number of 2D noise samples taken, so the cost claim is auditable
 /// by a test rather than asserted in a comment.
 pub fn carve(chunk: &mut impl CarveTarget, seed: u32) -> u64 {
+    carve_scaled(chunk, seed, TUNNELS_PER_CHUNK, RADIUS)
+}
+
+/// [`carve`] with the density and radius knobs exposed.
+///
+/// Exists so the two costs can be told apart: density multiplies how many
+/// tunnels are walked, radius multiplies how many voxels each capsule tests.
+/// Holding coverage fixed while trading one against the other is the only way
+/// to see which one the wall clock is actually paying for.
+pub fn carve_scaled(chunk: &mut impl CarveTarget, seed: u32, density: f32, radius: f32) -> u64 {
     let fields = Fields::new(seed);
     let mut samples = 0u64;
 
@@ -388,7 +399,7 @@ pub fn carve(chunk: &mut impl CarveTarget, seed: u32) -> u64 {
         for cz in (cell_z - SEARCH_CELLS)..=(cell_z + SEARCH_CELLS) {
             // Seeding is deterministic per cell, so the same tunnel is produced
             // no matter which chunk is being carved.
-            if hash_f32(seed, cx, cz) >= TUNNELS_PER_CHUNK {
+            if hash_f32(seed, cx, cz) >= density {
                 continue;
             }
             let jx = hash_f32(seed, cx, cz.wrapping_add(0x5EED));
@@ -400,7 +411,7 @@ pub fn carve(chunk: &mut impl CarveTarget, seed: u32) -> u64 {
             // this chunk would ideally pay: the count must describe the work
             // done, and a walk is re-derived for every chunk it touches.
             samples += (TUNNEL_LENGTH / STEP) as u64 * 2 + 3;
-            stamp_tunnel(chunk, &fields, sx, sz);
+            stamp_tunnel(chunk, &fields, sx, sz, radius);
         }
     }
 
