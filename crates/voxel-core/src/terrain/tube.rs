@@ -20,16 +20,20 @@
 //! type, and pure arithmetic per voxel. A 3D carver spends one sample per
 //! **voxel**.
 //!
-//! # Known coupling (not fixed here)
+//! # Absolute placement, and why it is a shared constant
 //!
-//! [`WORLD_HEIGHT`] is a fixed `64.0`, so cave centres sit at
-//! `64 * BAND_CENTRE_FRACTION = 25.6` whatever the surface pass does. If the
-//! surface band moves — as it does when the heightmap's absolute-Y constants
-//! change — the caves stop sitting just under the terrain and the coverage
-//! measured here falls out of its 19-20% band. That is a shared-constant bug
-//! across all three carvers, not a tuning problem in this one, and retuning the
-//! band here would only move the magic number. The fix belongs in the shared
-//! placement constants.
+//! Cave placement is derived from [`heightmap::BASE_Y`] and
+//! [`heightmap::AMPLITUDE`](crate::terrain::heightmap::AMPLITUDE) — the same
+//! constants the surface pass builds the terrain from — via [`band_centre`].
+//!
+//! It was once derived from a hardcoded `WORLD_HEIGHT = 64.0` instead. That
+//! worked only while the surface band was also a fraction of the world box.
+//! When the surface band became absolute the caves kept their old depth, ended
+//! up ~29 voxels under the terrain, and carved in a band the measurement window
+//! did not even cover. Deriving both from one source is what stops the two
+//! disagreeing again; [`caves_are_placed_under_the_terrain_band`] is the guard.
+//!
+//! [`caves_are_placed_under_the_terrain_band`]: tests::caves_are_placed_under_the_terrain_band
 //!
 //! # The three Minecraft cave types, in 2D
 //!
@@ -126,14 +130,26 @@ use crate::terrain::CarveTarget;
 use crate::terrain::noise::cave_2d;
 use fastnoise_lite::FastNoiseLite;
 
-/// World height the band is derived from, matching the other carvers.
-const WORLD_HEIGHT: f32 = 64.0;
-
-/// Where a column's cave interval sits, as a fraction of world height.
+/// How far below the surface's mean height a column's cave interval is centred,
+/// as a fraction of the surface band's amplitude.
 ///
-/// The surface lands at `0.55h`, so a centre of `0.40h` keeps the tubes
-/// underground.
-pub const BAND_CENTRE_FRACTION: f32 = 0.40;
+/// Absolute, not a fraction of a world-height literal: the centre is placed
+/// relative to [`heightmap::BASE_Y`](crate::terrain::heightmap::BASE_Y), the
+/// same constant the surface pass builds the terrain from, so the two cannot
+/// disagree when the surface band moves.
+pub const BAND_CENTRE_GAP: f32 = 0.40;
+
+/// The absolute world `y` a cave interval is centred on, before the depth field
+/// moves it.
+///
+/// Derived from the surface band's own constants, never from a literal world
+/// height. A previous version multiplied a hardcoded `64.0` by a fraction, so
+/// when the surface band became absolute the caves kept their old depth and
+/// ended up ~29 voxels below the terrain and partly outside the measured band.
+#[inline]
+pub const fn band_centre() -> f32 {
+    crate::terrain::heightmap::BASE_Y - crate::terrain::heightmap::AMPLITUDE * BAND_CENTRE_GAP
+}
 
 /// How far an interval's centre swings with its depth field, in voxels.
 pub const DEPTH_AMPLITUDE: f32 = 16.0;
@@ -464,7 +480,7 @@ pub(crate) fn interval_for(corner: Corner, config: &TypeConfig) -> Interval {
         return Interval::EMPTY;
     }
     Interval {
-        centre: WORLD_HEIGHT * BAND_CENTRE_FRACTION + corner.depth * DEPTH_AMPLITUDE,
+        centre: band_centre() + corner.depth * DEPTH_AMPLITUDE,
         half_height: config.radius * width,
     }
 }
@@ -566,10 +582,15 @@ pub fn carve_fraction_types(seed: u32, side: i32, types: &[TypeConfig; 3]) -> f6
     use crate::terrain::{generate_surface, heightmap::HeightMap};
     use crate::world::Chunk;
 
-    let hm = HeightMap::fitted_to_world(seed, WORLD_HEIGHT as u32);
+    let hm = HeightMap::fitted_to_world(seed, crate::terrain::heightmap::BASE_Y as u32);
     let (mut solid, mut carved) = (0u64, 0u64);
 
-    for cy in 1..3 {
+    // The chunks the caves actually occupy, derived from the band's own centre
+    // rather than from a fixed chunk index. The caves sit ~10 voxels under a
+    // mean surface of `BASE_Y`, so a band pinned to chunks 1..3 (y 16..47)
+    // measures rock the carver never touches and reports ~1% coverage for a
+    // carver that is working correctly.
+    for cy in crate::terrain::measured_band_chunks() {
         for cx in 0..side {
             for cz in 0..side {
                 let pos = ChunkPos::new(cx, cy, cz);
@@ -613,7 +634,7 @@ mod tests {
     const SIDE: u32 = 8;
 
     fn generated(pos: ChunkPos) -> Chunk {
-        let hm = HeightMap::fitted_to_world(SEED, WORLD_HEIGHT as u32);
+        let hm = HeightMap::fitted_to_world(SEED, crate::terrain::heightmap::BASE_Y as u32);
         let mut c = Chunk::at(pos);
         generate_surface(&mut c, pos, &hm);
         c
@@ -636,7 +657,7 @@ mod tests {
     /// the same world and can be quoted together. `cavestat` builds a taller
     /// world (`SIDE * 16` voxels) and its numbers are the taller one's.
     fn world(types: &[TypeConfig; 3]) -> caves::CaveStats {
-        let hm = HeightMap::fitted_to_world(SEED, WORLD_HEIGHT as u32);
+        let hm = HeightMap::fitted_to_world(SEED, crate::terrain::heightmap::BASE_Y as u32);
         let mut grid = ChunkGrid::new(SIDE, SIDE, SIDE);
         for pos in grid.positions().collect::<Vec<_>>() {
             let c = grid.get_mut(pos);
@@ -663,7 +684,10 @@ mod tests {
 
     #[test]
     fn fields_are_deterministic_for_a_seed() {
-        let pos = ChunkPos::new(1, 1, 2);
+        // A chunk inside the cave band, not an arbitrary one: caves are placed
+        // under the terrain, so a chunk outside the band would compare two
+        // equally empty results and prove nothing about the noise.
+        let pos = cave_band_chunk(1, 2);
         let mut a = generated(pos);
         let mut b = generated(pos);
         let sa = carve(&mut a, SEED);
@@ -678,15 +702,27 @@ mod tests {
 
     #[test]
     fn the_carver_actually_carves() {
-        let mut chunk = generated(ChunkPos::new(1, 1, 1));
+        let mut chunk = generated(cave_band_chunk(1, 1));
         let before = stone_count(&chunk);
         carve(&mut chunk, SEED);
         assert!(stone_count(&chunk) < before, "the carver removed no rock");
     }
 
+    /// The chunk the carver actually places caves in, at a world column inside
+    /// the surface band.
+    ///
+    /// Caves are placed under the terrain, so a test fixture has to sample the
+    /// band [`measured_band_chunks`] returns. Fixtures pointing at a fixed
+    /// low chunk would silently test "the carver removes rock from an empty
+    /// basement" and pass or fail for the wrong reason.
+    fn cave_band_chunk(cx: i32, cz: i32) -> ChunkPos {
+        let band = crate::terrain::measured_band_chunks();
+        ChunkPos::new(cx, band.start + 1, cz)
+    }
+
     #[test]
     fn carving_only_ever_turns_solid_into_air() {
-        let mut chunk = generated(ChunkPos::new(2, 1, 1));
+        let mut chunk = generated(cave_band_chunk(2, 1));
         let original = *chunk.blocks();
         carve(&mut chunk, SEED);
         for (&was, &now) in original.iter().zip(chunk.blocks()) {
@@ -701,7 +737,7 @@ mod tests {
 
     #[test]
     fn carve_is_idempotent() {
-        let mut once = generated(ChunkPos::new(1, 1, 1));
+        let mut once = generated(cave_band_chunk(1, 1));
         carve(&mut once, SEED);
         let mut twice = once.clone();
         carve(&mut twice, SEED);
@@ -745,7 +781,11 @@ mod tests {
     /// standalone query over a whole chunk: they must agree everywhere.
     #[test]
     fn the_query_agrees_with_the_carver_voxel_for_voxel() {
-        for pos in [ChunkPos::new(1, 1, 1), ChunkPos::new(0, 1, 2), ChunkPos::new(-2, 1, 1)] {
+        for pos in [
+            cave_band_chunk(1, 1),
+            cave_band_chunk(0, 2),
+            cave_band_chunk(-2, 1),
+        ] {
             let mut chunk = generated(pos);
             let original = chunk.clone();
             carve(&mut chunk, SEED);
@@ -999,21 +1039,16 @@ mod tests {
 
     /// Each type's carve fraction sits in a band that its own tuning justifies,
     /// so a retune that doubles a type's coverage is caught rather than shipped.
+    ///
+    /// Re-baselined by task-5, which made cave placement absolute. These are
+    /// fractions of the rock in [`measured_band_chunks`](crate::terrain::measured_band_chunks),
+    /// so they move if that band moves, not only if the carver changes.
     #[test]
     fn per_type_coverage_matches_the_tuned_settings() {
-        // TASK-5 (absolute-Y cave placement) NOTE: these bands were measured
-        // while the surface band was box-fitted to the world height. Task-3
-        // made the surface band absolute (`heightmap::BASE_Y` 64 +- 24, i.e.
-        // absolute 40..88) while this carver still derives its cave band from
-        // its own `WORLD_HEIGHT = 64.0`, so cave centres stayed at absolute ~27
-        // and the terrain moved up ~29 voxels. Coverage fell as a result; these
-        // numbers pin the CURRENT, pre-retune behaviour so the tree stays green
-        // and the drop is visible. Task-5 re-baselines them and this comment
-        // must be deleted then.
         let expected = [
-            (CaveType::Cheese, 7.0f64, 8.5),
-            (CaveType::Spaghetti, 5.0, 6.5),
-            (CaveType::Noodle, 1.0, 2.5),
+            (CaveType::Cheese, 5.5f64, 7.5),
+            (CaveType::Spaghetti, 4.0, 5.5),
+            (CaveType::Noodle, 1.3, 2.5),
         ];
         for (cave_type, lo, hi) in expected {
             let pct = carve_fraction_types(SEED, SIDE as i32, &only(cave_type));
@@ -1025,23 +1060,24 @@ mod tests {
         }
     }
 
-    /// Coverage parity: the carver stays in the same 19-20% band the other
-    /// carvers are measured in, so a speed comparison is like-for-like. The
-    /// three types' epsilons were scaled to 0.56 of their initial values to
-    /// reach it (measured 31.1% before, 19.6% after); connectivity did not
-    /// move, which is why epsilon was the knob to turn.
+    /// Coverage: the carver takes a steady fraction of the rock in the band it
+    /// is measured over.
+    ///
+    /// **Not comparable with the other carvers' historical 19-20% parity band.**
+    /// That band counted the rock in chunks 1..3 (world y 16..47); task-5 moved
+    /// the measurement onto [`measured_band_chunks`](crate::terrain::measured_band_chunks)
+    /// (chunks 2..6, y 32..95, roughly twice the solid rock) because the old
+    /// window did not contain the caves at all once placement became absolute.
+    /// The carve itself did not shrink: the same tunnels now sit inside a taller
+    /// window, so the ratio falls while the absolute carved volume is unchanged.
+    /// A like-for-like comparison against the other carvers must use the same band.
     #[test]
     fn coverage_is_in_the_parity_band() {
-        // TASK-5 NOTE: was 19-20% while the surface band was box-fitted. After
-        // task-3 made the band absolute, this carver's caves (band derived from
-        // its own `WORLD_HEIGHT = 64.0`, centres ~absolute 27) sit ~29 voxels
-        // below the terrain, so coverage fell. Pinned to the current number so
-        // the tree stays green; task-5 re-baselines it.
         let pct = carve_fraction(SEED, SIDE as i32);
-        println!("tube carver carve fraction over the 8x2x8 band: {pct:.2}%");
+        println!("tube carver carve fraction over the measured band: {pct:.2}%");
         assert!(
-            (13.0..=14.0).contains(&pct),
-            "carve fraction {pct:.2}% left the pinned 13-14% band (task-5)"
+            (10.5..=13.5).contains(&pct),
+            "carve fraction {pct:.2}% left the measured 10.5-13.5% band"
         );
     }
 
@@ -1082,6 +1118,128 @@ mod tests {
             disagreeing, 0,
             "carver and query disagree at {disagreeing} of {checked} solid voxels"
         );
+    }
+
+    /// Caves are placed under the terrain, not in the sky and not in the
+    /// basement.
+    ///
+    /// This is the guard against the bug task-5 fixed. Placement was once
+    /// derived from a hardcoded `WORLD_HEIGHT = 64.0` while the surface band was
+    /// absolute, so caves sat ~29 voxels below the terrain and this carver
+    /// carved nothing at all in the chunks its own coverage test sampled. A
+    /// coverage percentage could not catch that — the carver still carved, just
+    /// in the wrong place — so this asserts WHERE, not how much.
+    ///
+    /// Derived from the band constants rather than literals, so moving the
+    /// surface band moves the expectation with it instead of silently passing.
+    #[test]
+    fn caves_are_placed_under_the_terrain_band() {
+        let surface_mean = crate::terrain::heightmap::BASE_Y;
+        let amplitude = crate::terrain::heightmap::AMPLITUDE;
+        let hm = crate::terrain::heightmap::HeightMap::fitted_to_world(
+            SEED,
+            crate::terrain::heightmap::BASE_Y as u32,
+        );
+
+        // Over a 4x4 column, not one chunk: the band is thin at its top edge and
+        // an isolated chunk there is often empty, which says nothing about
+        // placement. Sampling one chunk is how a real placement bug hides.
+        let surface_layer = (surface_mean as i32).div_euclid(16);
+        let mut carved = 0u64;
+        for cx in 0..4 {
+            for cz in 0..4 {
+                let pos = ChunkPos::new(cx, surface_layer, cz);
+                let mut chunk = Chunk::at(pos);
+                generate_surface(&mut chunk, pos, &hm);
+                let before = stone_count(&chunk);
+                carve(&mut chunk, SEED);
+                carved += before - stone_count(&chunk);
+            }
+        }
+        assert!(
+            carved > 0,
+            "no cave carved in the layer containing the surface mean \
+             y={surface_mean}; caves are placed relative to BASE_Y/AMPLITUDE, so \
+             they must reach it"
+        );
+
+        // And the carve must be *below* the surface, within the amplitude's
+        // reach, not somewhere else entirely.
+        let centre = band_centre();
+        assert!(
+            (surface_mean - amplitude..=surface_mean).contains(&centre),
+            "cave centre {centre} is not under the surface mean {surface_mean} \
+             within the band amplitude {amplitude}"
+        );
+    }
+
+    /// The per-`y` air histogram, the instrument task-5 was accepted on.
+    ///
+    /// A coverage percentage is satisfied by carving the wrong rock, so the
+    /// placement question has to be asked per band: caves must appear at and
+    /// below the surface mean, and must NOT appear in the low chunks where the
+    /// pre-task-5 bug put them.
+    #[test]
+    fn carved_air_appears_in_the_surface_band_and_not_below_it() {
+        let seed = SEED;
+        let surface_mean = crate::terrain::heightmap::BASE_Y;
+        let amplitude = crate::terrain::heightmap::AMPLITUDE;
+        let hm = crate::terrain::heightmap::HeightMap::fitted_to_world(
+            seed,
+            crate::terrain::heightmap::BASE_Y as u32,
+        );
+        let band = crate::terrain::measured_band_chunks();
+
+        // Count carved air per chunk layer over a 4x4 column, so an isolated
+        // empty chunk cannot be mistaken for a placement failure.
+        let mut per_layer = std::collections::BTreeMap::new();
+        for cy in band.clone() {
+            let mut carved = 0u64;
+            for cx in 0..4 {
+                for cz in 0..4 {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    let mut chunk = Chunk::at(pos);
+                    generate_surface(&mut chunk, pos, &hm);
+                    let before = stone_count(&chunk);
+                    carve(&mut chunk, seed);
+                    carved += before - stone_count(&chunk);
+                }
+            }
+            per_layer.insert(cy, carved);
+        }
+        println!("carved air per chunk layer: {per_layer:?}");
+
+        let total: u64 = per_layer.values().sum();
+        assert!(total > 0, "the carver carved nothing in the band at all");
+
+        // The carve must PEAK in the layer containing the surface mean, not at
+        // the bottom of the band. This is the placement property, and it is
+        // deliberately about where the mass is rather than that a floor is
+        // exactly zero: tubes slope across chunk boundaries, so a small tail in
+        // the neighbouring layer is correct and a zero-floor assertion would be
+        // both wrong and brittle.
+        let peak = per_layer
+            .iter()
+            .max_by_key(|(_, v)| **v)
+            .map(|(&cy, _)| cy)
+            .expect("band is non-empty");
+        let surface_layer = (surface_mean as i32).div_euclid(16);
+        assert!(
+            peak >= surface_layer - 1,
+            "the carve peaks at layer {peak}, below the surface layer \
+             {surface_layer}: that is the pre-task-5 placement (caves ~29 voxels \
+             under the terrain). Per-layer counts: {per_layer:?}"
+        );
+
+        // And the mass must be under the surface, not in the sky above it.
+        let above_surface_layer = (surface_mean as i32 + amplitude as i32).div_euclid(16);
+        let mut above = 0u64;
+        for (&cy, &v) in &per_layer {
+            if cy > above_surface_layer {
+                above += v;
+            }
+        }
+        assert_eq!(above, 0, "caves carved above the surface band: {per_layer:?}");
     }
 
     /// Emptying a type's band must remove exactly that type's contribution:

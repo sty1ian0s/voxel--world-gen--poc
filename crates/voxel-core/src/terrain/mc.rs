@@ -96,14 +96,9 @@ pub const BOTTOM_BIAS: f32 = 0.30;
 /// highest possible surface.
 pub const ROOF_FRACTION: f32 = 0.25;
 
-/// The solid band the caves are biased into, as fractions of the world height,
-/// matching [`HeightMap::fitted_to_world`](crate::terrain::heightmap::HeightMap::fitted_to_world).
-const BAND_BASE_FRACTION: f32 = 0.55;
-const BAND_AMPLITUDE_FRACTION: f32 = 0.18;
-
-/// World height the band is derived from. The default world is `VOXEL_WORLD_Y=4`
-/// chunks, which is what `CarveParity` and the parity test sample.
-const WORLD_HEIGHT: f32 = 64.0;
+// The band's absolute placement lives in BAND_LO/BAND_HI below, derived from
+// `heightmap::BASE_Y`/`AMPLITUDE` — the constants the surface pass uses — so the
+// caves cannot be left behind by a change to the surface band.
 
 /// Which noise field is which. Kept as an enum because [`noise::cave`] derives
 /// the seed offset from it, so two fields can never silently share a seed.
@@ -262,10 +257,11 @@ impl Field {}
 /// if a future retune pushes past it.
 const MARGIN: f32 = 0.44;
 
-/// The two ends of the band. `0.55h +- 0.18h`: the base and amplitude the
-/// heightmap is fitted to.
-const BAND_LO: f32 = WORLD_HEIGHT * (BAND_BASE_FRACTION - BAND_AMPLITUDE_FRACTION);
-const BAND_HI: f32 = WORLD_HEIGHT * (BAND_BASE_FRACTION + BAND_AMPLITUDE_FRACTION);
+/// The two ends of the band: the same absolute span the surface pass builds its
+/// terrain in, taken from the surface band's own constants rather than from a
+/// world-height literal.
+const BAND_LO: f32 = crate::terrain::heightmap::BASE_Y - crate::terrain::heightmap::AMPLITUDE;
+const BAND_HI: f32 = crate::terrain::heightmap::BASE_Y + crate::terrain::heightmap::AMPLITUDE;
 
 /// Position of a world voxel along the vertical bias curve: `0` at the bottom
 /// of the solid band, `1` at the highest surface the band can produce.
@@ -478,10 +474,10 @@ pub fn carve_fraction_at(seed: u32, side: i32, fields: &[FieldConfig; 4]) -> f64
     use crate::terrain::heightmap::HeightMap;
     use crate::world::Chunk;
 
-    let hm = HeightMap::fitted_to_world(seed, WORLD_HEIGHT as u32);
+    let hm = HeightMap::fitted_to_world(seed, crate::terrain::heightmap::BASE_Y as u32);
     let (mut solid, mut carved) = (0u64, 0u64);
 
-    for cy in 1..3 {
+    for cy in crate::terrain::measured_band_chunks() {
         for cx in 0..side {
             for cz in 0..side {
                 let pos = crate::domain::ChunkPos::new(cx, cy, cz);
@@ -541,7 +537,7 @@ mod tests {
     /// the level the caves are.
     fn band(side: i32) -> Vec<ChunkPos> {
         let mut out = Vec::new();
-        for cy in 1..3 {
+        for cy in crate::terrain::measured_band_chunks() {
             for cx in 0..side {
                 for cz in 0..side {
                     out.push(ChunkPos::new(cx, cy, cz));
@@ -622,11 +618,6 @@ mod tests {
         // pre-change file — so it is a pre-existing off-by-one in the assertion,
         // not a consequence of the absolute band. It is fixed here because the
         // tree must be green, and fixed on the TEST side only.
-        //
-        // TASK-5 NOTE: the band this carver derives (23.7..46.7 absolute) no
-        // longer coincides with the absolute surface band (`heightmap::BASE_Y`
-        // 64 +- 24, 40..88), a ~29-voxel gap; task-5 makes cave placement
-        // absolute and re-baselines this bound against the real surface band.
         for pos in band(4) {
             let mut chunk = generated(pos);
             let before: Vec<_> = (0..4096u16)
@@ -695,21 +686,16 @@ mod tests {
     fn coverage_is_in_the_parity_band() {
         // The measurement that makes the speed comparison honest. Prints so the
         // number is reported rather than merely bounded: `--nocapture`.
-        // TASK-5 (absolute-Y cave placement) NOTE: this band was 19-20% while
-        // the surface band was box-fitted to the world height. Task-3 made the
-        // surface band absolute (`heightmap::BASE_Y` 64 +- 24, i.e. absolute
-        // 40..88) but this carver still derives its cave band from its own
-        // `WORLD_HEIGHT = 64.0`, so cave centres stayed at absolute ~27 while
-        // the terrain moved up ~29 voxels. The carve now lands deeper in the
-        // rock and coverage fell to 14.38%. The band below pins the CURRENT,
-        // pre-retune number so the tree stays green and the change is visible;
-        // task-5 re-baselines it once cave placement is absolute, and this
-        // comment must be deleted then.
+        //
+        // Re-baselined by task-5, which made cave placement absolute. The
+        // fraction is taken over
+        // [`measured_band_chunks`](crate::terrain::measured_band_chunks), so it
+        // also moves if that band moves — compare carvers on the same band.
         let pct = carve_fraction(SEED, 8);
-        println!("mc carver carve fraction over the 8x2x8 band: {pct:.2}%");
+        println!("mc carver carve fraction over the measured band: {pct:.2}%");
         assert!(
-            (14.0..=15.0).contains(&pct),
-            "carve fraction {pct:.2}% left the pinned 14-15% band (task-5)"
+            (15.5..=18.5).contains(&pct),
+            "carve fraction {pct:.2}% left the measured 15.5-18.5% band"
         );
     }
 
@@ -750,7 +736,7 @@ mod tests {
     /// and carve percentage.
     fn world_after(fields: &[FieldConfig], side: u32) -> (f64, f64) {
         let mut grid = ChunkGrid::new(side, side, side);
-        let hm = HeightMap::fitted_to_world(SEED, WORLD_HEIGHT as u32);
+        let hm = HeightMap::fitted_to_world(SEED, crate::terrain::heightmap::BASE_Y as u32);
         let mut solid = 0u64;
         let mut carved = 0u64;
         for pos in grid.positions().collect::<Vec<_>>() {
@@ -759,7 +745,7 @@ mod tests {
             let before = stone_count(chunk);
             // Coverage is counted over the parity band only, so it is the same
             // quantity `carve_fraction_at` reports and the two can be compared.
-            let in_band = (1..3).contains(&pos.y);
+            let in_band = crate::terrain::measured_band_chunks().contains(&pos.y);
             if in_band {
                 solid += before;
             }

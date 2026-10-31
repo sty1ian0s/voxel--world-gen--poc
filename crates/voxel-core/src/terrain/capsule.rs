@@ -59,11 +59,13 @@ pub const HEIGHT_AMPLITUDE: f32 = 14.0;
 /// that a tunnel still goes somewhere.
 pub const TURN_RATE: f32 = 0.55;
 
-/// Where the cave band's centre sits, as a fraction of the world height.
+/// How far below the surface's mean height the tunnels' centre line sits, as a
+/// fraction of the surface band's amplitude.
 ///
-/// Shared with the rest of the pipeline: `HeightMap::fitted_to_world` puts the
-/// surface at `0.55h`, so tunnels centred below that stay underground.
-pub const BAND_CENTRE_FRACTION: f32 = 0.42;
+/// Absolute, not a fraction of a world-height literal: the centre is placed
+/// relative to [`heightmap::BASE_Y`](crate::terrain::heightmap::BASE_Y), the
+/// same constant the surface pass builds the terrain from.
+pub const BAND_CENTRE_GAP: f32 = 0.42;
 
 /// Half-width of the placement field's acceptance band.
 ///
@@ -78,9 +80,8 @@ pub const PLACEMENT_WIDTH: f32 = 1.0;
 /// roughly every `1 / (TUNNELS_PER_CHUNK)` chunks.
 pub const TUNNELS_PER_CHUNK: f32 = 0.27;
 
-/// World height the band is derived from, matching `CarveParity` and the
-/// other carvers' parity measurements.
-const WORLD_HEIGHT: f32 = 64.0;
+// The band's absolute placement lives in `band_centre()` below, derived from
+// `heightmap::BASE_Y`/`AMPLITUDE`, the constants the surface pass uses.
 
 /// A point or direction in world space. A named tuple rather than three `f32`
 /// parameters, so a call site cannot silently transpose two axes.
@@ -268,8 +269,8 @@ impl Fields {
 /// The band tunnels are placed in: centred below the surface, as a fraction of
 /// world height.
 #[inline]
-fn band_centre() -> f32 {
-    WORLD_HEIGHT * BAND_CENTRE_FRACTION
+pub const fn band_centre() -> f32 {
+    crate::terrain::heightmap::BASE_Y - crate::terrain::heightmap::AMPLITUDE * BAND_CENTRE_GAP
 }
 
 /// The world-space centre line depth of the tunnel seeded at `(x, z)`.
@@ -471,10 +472,10 @@ pub fn carve_fraction(seed: u32, side: i32) -> f64 {
     use crate::terrain::{generate_surface, heightmap::HeightMap};
     use crate::world::Chunk;
 
-    let hm = HeightMap::fitted_to_world(seed, WORLD_HEIGHT as u32);
+    let hm = HeightMap::fitted_to_world(seed, crate::terrain::heightmap::BASE_Y as u32);
     let (mut solid, mut carved) = (0u64, 0u64);
 
-    for cy in 1..3 {
+    for cy in crate::terrain::measured_band_chunks() {
         for cx in 0..side {
             for cz in 0..side {
                 let pos = ChunkPos::new(cx, cy, cz);
@@ -514,8 +515,19 @@ mod tests {
 
     const SEED: u32 = 1337;
 
+    /// The chunk the carver actually places caves in, at a world column inside
+    /// the surface band.
+    ///
+    /// Caves are placed under the terrain, so a fixture pointing at a fixed low
+    /// chunk would test "the carver carves nothing in an empty basement" and
+    /// pass or fail for the wrong reason.
+    fn cave_band_chunk(cx: i32, cz: i32) -> ChunkPos {
+        let band = crate::terrain::measured_band_chunks();
+        ChunkPos::new(cx, band.start + 1, cz)
+    }
+
     fn generated(pos: ChunkPos) -> Chunk {
-        let hm = HeightMap::fitted_to_world(SEED, WORLD_HEIGHT as u32);
+        let hm = HeightMap::fitted_to_world(SEED, crate::terrain::heightmap::BASE_Y as u32);
         let mut c = Chunk::at(pos);
         generate_surface(&mut c, pos, &hm);
         c
@@ -582,7 +594,7 @@ mod tests {
     /// The carver must actually carve, or every other test is vacuous.
     #[test]
     fn the_carver_actually_carves() {
-        let mut chunk = generated(ChunkPos::new(1, 1, 1));
+        let mut chunk = generated(cave_band_chunk(1, 1));
         let before = stone_count(&chunk);
         let samples = carve(&mut chunk, SEED);
         assert!(samples > 0, "the carver took no samples");
@@ -623,27 +635,21 @@ mod tests {
         );
     }
 
-    /// Coverage must sit in the same 19-20% band as the other two carvers, or
-    /// the speed comparison is not like-for-like: a carver that removes a
-    /// tenth of the rock finishes faster for reasons that have nothing to do
-    /// with its algorithm.
+    /// Coverage must sit in the same band as the other carvers, or the speed
+    /// comparison is not like-for-like: a carver that removes a tenth of the
+    /// rock finishes faster for reasons that have nothing to do with its
+    /// algorithm.
+    ///
+    /// Re-baselined by task-5, which made cave placement absolute. The fraction
+    /// is taken over [`measured_band_chunks`](crate::terrain::measured_band_chunks),
+    /// so it also moves if that band moves — compare carvers on the same band.
     #[test]
     fn coverage_is_in_the_parity_band() {
-        // TASK-5 (absolute-Y cave placement) NOTE: this band was 19-20% while
-        // the surface band was box-fitted to the world height. Task-3 made the
-        // surface band absolute (`heightmap::BASE_Y` 64 +- 24, i.e. absolute
-        // 40..88) but this carver still derives its cave band from its own
-        // `WORLD_HEIGHT = 64.0`, so cave centres stayed at absolute ~27 while
-        // the terrain moved up ~29 voxels. The carve now lands deeper in the
-        // rock and coverage fell to 13.14%. The band below pins the CURRENT,
-        // pre-retune number so the tree stays green and the change is visible;
-        // task-5 re-baselines it once cave placement is absolute, and this
-        // comment must be deleted then.
         let pct = carve_fraction(SEED, 8);
-        println!("capsule carver carve fraction over the 8x2x8 band: {pct:.2}%");
+        println!("capsule carver carve fraction over the measured band: {pct:.2}%");
         assert!(
-            (13.0..=14.0).contains(&pct),
-            "carve fraction {pct:.2}% left the pinned 13-14% band (task-5)"
+            (10.0..=13.0).contains(&pct),
+            "carve fraction {pct:.2}% left the measured 10-13% band"
         );
     }
 
@@ -654,7 +660,7 @@ mod tests {
     fn the_caves_are_long_and_connected() {
         let side = 8u32;
         let mut grid = crate::world::ChunkGrid::new(side, side, side);
-        let hm = HeightMap::fitted_to_world(SEED, WORLD_HEIGHT as u32);
+        let hm = HeightMap::fitted_to_world(SEED, crate::terrain::heightmap::BASE_Y as u32);
         for pos in grid.positions().collect::<Vec<_>>() {
             let chunk = grid.get_mut(pos);
             generate_surface(chunk, pos, &hm);

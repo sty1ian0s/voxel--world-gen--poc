@@ -23,6 +23,32 @@ pub mod sparse;
 use crate::domain::{BlockId, ChunkPos, LocalPos, VoxelIndex};
 use crate::world::Chunk;
 
+/// The chunk layers the cave carvers actually place caves in, as a range of
+/// chunk `y` indices around the surface band.
+///
+/// The cave carvers put their caves a little under the mean surface, which is
+/// [`heightmap::BASE_Y`], and the surface itself swings by
+/// [`heightmap::AMPLITUDE`]. Every carver's coverage measurement has to count
+/// the rock that band covers, so the band is derived from those same constants
+/// rather than from a fixed pair of chunk indices.
+///
+/// This is not cosmetic. The measurements used a literal `1..3` (world y
+/// 16..47) while cave placement was separately derived from a hardcoded world
+/// height. When placement became absolute the caves moved up ~28 voxels and
+/// fell outside that fixed window, so three carvers that were working correctly
+/// all reported ~1% coverage. Deriving both from one source is what keeps the
+/// measurement and the placement from disagreeing again.
+pub fn measured_band_chunks() -> std::ops::Range<i32> {
+    // From the bottom of the surface band down to a little past the cave
+    // centre, so the window always contains both the terrain and the caves
+    // underneath it.
+    let lo = heightmap::BASE_Y - heightmap::AMPLITUDE;
+    let hi = heightmap::BASE_Y + heightmap::AMPLITUDE;
+    let first = (lo as i32).div_euclid(16);
+    let last = (hi as i32).div_euclid(16);
+    first..last + 1
+}
+
 /// What a carver is allowed to write to. Keeps the two Pass 2 implementations
 /// honest: a carver can only ever turn solid voxels into air within the chunk
 /// it was given, so neither can affect a neighbour and the "bounded padding"
