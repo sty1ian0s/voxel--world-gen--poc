@@ -18,6 +18,7 @@ pub mod ascii;
 pub mod caves;
 pub mod image;
 pub mod report;
+pub mod window;
 
 /// Which slice of the world a view shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

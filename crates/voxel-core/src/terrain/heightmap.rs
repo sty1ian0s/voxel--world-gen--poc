@@ -4,8 +4,50 @@
 //! benchmark compares cave carving rather than terrain setup. Pure function of
 //! `(seed, x, z)`, which is what lets chunk generation run in any order on any
 //! thread and still agree.
+//!
+//! ## Absolute Y, not box-relative
+//!
+//! The band is a fixed range of **absolute world Y** ([`BASE_Y`] ±
+//! [`AMPLITUDE`]), the way Minecraft's overworld has a fixed `-56..180` span.
+//! That is the whole point: `(seed, x, z) -> height` must not mention the world
+//! size, or two runs of the same seed at different heights describe different
+//! worlds and cannot be compared or clipped.
+//!
+//! This replaces `fitted_to_world(seed, world_height)`, which derived base,
+//! amplitude and sea level from the box (`h * 0.55`, `h * 0.18`, `h * 0.5`). It
+//! was written to stop a short world generating as solid stone, and it did — at
+//! the cost of making terrain a function of world *size*. A world height is now
+//! purely a clipping window: the same world, with Y outside the window simply
+//! not materialised.
+//!
+//! The old shape also meant a world under 32 voxels tall had `sea_level` at or
+//! above its own ceiling, so no column reached the top of a chunk and
+//! `Chunk::enclosed` could never be set, silently losing solid-rock culling.
+//! Sea level is now absolute too, so that cannot recur: it is either inside a
+//! window or it is not, and `sea_level_is_absolute_not_derived_from_the_window`
+//! asserts it.
 
 use super::noise;
+
+/// Mean surface height, in absolute world Y.
+///
+/// 64 is the same centre the old `new(seed, sea_level)` used for its base, so
+/// terrain that was already tuned against `HeightMap::new` keeps its shape.
+pub const BASE_Y: f32 = 64.0;
+
+/// Surface height deviation around [`BASE_Y`], in voxels.
+///
+/// 24 gives a band of 40..88, which matches `HeightMap::new`'s original base 64
+/// amplitude 24 exactly. Every carver's tuning — `density::CARVE_THRESHOLD`, the
+/// capsule and tube coverage bands, the sparse stamp radii — was calibrated
+/// against that band, so keeping it is what stops this change from silently
+/// re-tuning all four carvers.
+pub const AMPLITUDE: f32 = 24.0;
+
+/// Sea level, in absolute world Y.
+///
+/// Absolute, like the band: a window that does not reach it simply has no ocean.
+pub const SEA_LEVEL: i32 = 62;
 
 /// Surface height and sea level for a world.
 ///
@@ -21,35 +63,38 @@ pub struct HeightMap {
 }
 
 impl HeightMap {
-    /// Base height 64, amplitude 24. Use [`WorldFit`] to place the terrain
-    /// inside a world box that does not reach that high.
+    /// The absolute band: base 64, amplitude 24, sea level 62.
+    pub const fn absolute(seed: u32) -> Self {
+        Self {
+            seed,
+            sea_level: SEA_LEVEL,
+            base: BASE_Y,
+            amplitude: AMPLITUDE,
+        }
+    }
+
+    /// Base height 64, amplitude 24, with the sea level given.
+    ///
+    /// Kept because tests use it to isolate water behaviour from the band, and
+    /// because the band it produces is the one [`Self::absolute`] now matches.
     pub const fn new(seed: u32, sea_level: i32) -> Self {
         Self {
             seed,
             sea_level,
-            base: 64.0,
-            amplitude: 24.0,
+            base: BASE_Y,
+            amplitude: AMPLITUDE,
         }
     }
 
-    /// Terrain sized to fit a world that is `world_height` voxels tall.
+    /// Terrain for a world of any height.
     ///
-    /// Without this a short world (the 4-chunk default is 64 voxels) sits
-    /// entirely *below* the surface, so every chunk generates as solid stone
-    /// with no caves, no water and no sky. Deriving the band from the world
-    /// height keeps the default config showing real terrain.
-    pub fn fitted_to_world(seed: u32, world_height: u32) -> Self {
-        let h = world_height as f32;
-        // Leave a quarter of the box as sky so the surface is visible, and
-        // scale the amplitude to the available room.
-        let base = h * 0.55;
-        let amplitude = h * 0.18;
-        Self {
-            seed,
-            sea_level: (h * 0.5) as i32,
-            base,
-            amplitude,
-        }
+    /// The height argument is accepted and ignored: the band is absolute, so the
+    /// same seed gives the same terrain whether the window is 64 voxels tall or
+    /// 512. Callers keep passing their world height so the clipping window stays
+    /// visible at the call site, but it cannot change the answer — which is
+    /// exactly the property `surface_height_ignores_world_size` asserts.
+    pub const fn fitted_to_world(seed: u32, _world_height: u32) -> Self {
+        Self::absolute(seed)
     }
 
     pub const fn base(&self) -> f32 {
@@ -68,7 +113,7 @@ impl HeightMap {
         self.sea_level
     }
 
-    /// Surface height at a world column, in world voxel units.
+    /// Surface height at a world column, in absolute world voxel units.
     pub fn height(&self, wx: i32, wz: i32) -> i32 {
         // One generator per call is fine: `FastNoiseLite` construction is a
         // handful of field writes, and rebuilding it keeps this function pure
@@ -84,14 +129,16 @@ impl HeightMap {
         (self.base + continent * self.amplitude * 0.5 + n2 * self.amplitude * 0.5).round() as i32
     }
 
-    /// Height clamped into this POC's world box.
+    /// Height clamped into a window `0..world_height`.
     ///
-    /// shortcut: the world is a fixed-size box, so heights outside it are
-    /// clamped flat. Upgrade to an infinite world when streaming lands.
+    /// Still a clamp rather than a rejection, because a caller asking for one
+    /// column's height has nowhere to put "outside". Chunk generation does not
+    /// use this: it clips by choosing which chunks to generate.
     pub fn height_clamped(&self, wx: i32, wz: i32, world_height: i32) -> i32 {
         self.height(wx, wz).clamp(0, world_height - 1)
     }
 }
+
 
 #[cfg(test)]
 mod tests {

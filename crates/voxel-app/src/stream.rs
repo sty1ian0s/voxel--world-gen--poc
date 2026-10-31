@@ -285,10 +285,17 @@ impl StreamWorld {
 mod tests {
     use super::*;
 
+    /// A world whose window actually contains sky above the terrain band.
+    ///
+    /// Was 64 voxels, which under the absolute surface band (`heightmap::BASE_Y`
+    /// 64 +- 24, i.e. absolute 40..88) is a window entirely at or below the
+    /// surface: every chunk is rock and there is no sky to cull. 128 voxels
+    /// spans the band with room above, which is what these tests need to say
+    /// anything about sky versus underground.
     fn world(carver: Carver) -> StreamWorld {
         StreamWorld::new(
             1337,
-            64,
+            128,
             CaveParams {
                 origin_density: 2.0,
                 min_radius: 1.5,
@@ -512,9 +519,76 @@ mod tests {
                 air += 1;
             }
         }
-        // The sky chunks are the ones above the terrain band, so a world this
-        // tall must have some.
+        // The sky chunks are the ones above the terrain band. The band is
+        // ABSOLUTE now (`heightmap::BASE_Y` 64 +- 24), so whether a window has
+        // sky is a property of the window, not of the seed: a 128-voxel window
+        // reaches above the band and must have empty chunks, while a 64-voxel
+        // one tops out at the band's mean and must have none.
         assert!(air > 0, "no empty chunks; the vertical band looks wrong");
+
+        // The same seed in a shorter window is the same world clipped, so it
+        // has no sky: its ceiling is below the band's mean surface height.
+        let mut low = StreamWorld::new(
+            1337,
+            64,
+            voxel_core::CaveParams {
+                origin_density: 2.0,
+                min_radius: 1.5,
+                max_radius: 4.0,
+            },
+            Carver::Sparse,
+        );
+        assert_eq!(low.bounds().len(), 4, "64 voxels is 4 chunks");
+        low.stream_around(ChunkPos::new(0, 0, 0), 1);
+        let low_air = low
+            .positions()
+            .filter(|&p| low.get(p).expect("generated").empty)
+            .count();
+        assert_eq!(
+            low_air, 0,
+            "a 64-voxel window tops out at the band's mean, so it has no sky"
+        );
+    }
+
+    /// The clipping property: a world height selects a window over one fixed
+    /// world, it does not rescale the world.
+    ///
+    /// Two windows of the same seed must agree byte-for-byte wherever they
+    /// overlap. This is the property that makes a "world height" a view rather
+    /// than a parameter, and it is what the absolute surface band buys.
+    #[test]
+    fn a_taller_window_clips_the_same_world_rather_than_rescaling_it() {
+        use voxel_core::world::{CarverSpec, WorldGen};
+        use voxel_core::{CaveParams, ChunkPos};
+
+        let spec = |world_height: u32| CarverSpec {
+            seed: 1337,
+            carver: Carver::Sparse,
+            cave: CaveParams {
+                origin_density: 2.0,
+                min_radius: 1.5,
+                max_radius: 4.0,
+            },
+            world_height,
+        };
+
+        let mut short = WorldGen::new(spec(64));
+        let mut tall = WorldGen::new(spec(128));
+
+        assert_eq!(short.bounds().len(), 4);
+        assert_eq!(tall.bounds().len(), 8);
+
+        let mut compared = 0;
+        for cy in 0..4 {
+            let pos = ChunkPos::new(0, cy, 0);
+            assert_eq!(
+                short.chunk_at(pos).to_packed(),
+                tall.chunk_at(pos).to_packed(),
+                "chunk {pos:?} differs between a 64- and a 128-voxel window"
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 4, "the overlap must cover the whole short window");
     }
 
     #[test]

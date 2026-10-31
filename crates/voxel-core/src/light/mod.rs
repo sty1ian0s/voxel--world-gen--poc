@@ -367,11 +367,13 @@ mod tests {
 
     #[test]
     fn sunlight_reaches_the_surface_of_generated_terrain() {
-        // Chunk y=2 of a 4-chunk-tall world straddles the surface band, so it
-        // has both open sky at the top and solid ground at the bottom. Chunk 3
-        // is entirely sky, which would make the comparison below vacuous.
-        let hm = HeightMap::fitted_to_world(1337, 64);
-        let pos = ChunkPos::new(0, 2, 0);
+        // The surface band is absolute (base 64 +- 24, see `heightmap`), so the
+        // chunk that straddles it is y=4, not y=2: it spans world y 64..79, with
+        // sky at its top and ground at its bottom. A 4-chunk world no longer
+        // contains any sky at all, which is the clipping window behaving
+        // correctly rather than a lighting bug.
+        let hm = HeightMap::fitted_to_world(1337, 128);
+        let pos = ChunkPos::new(0, 4, 0);
         let mut c = Chunk::at(pos);
         crate::terrain::generate_surface(&mut c, pos, &hm);
         relight_chunk(&mut c);
