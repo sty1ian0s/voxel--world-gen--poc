@@ -14,6 +14,7 @@
 
 pub mod capsule;
 pub mod density;
+pub mod tube;
 pub mod heightmap;
 pub mod mc;
 pub mod noise;

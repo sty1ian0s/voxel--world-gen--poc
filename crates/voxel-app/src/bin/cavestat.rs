@@ -12,7 +12,7 @@
 use voxel_core::config::{CaveParams, Config};
 use voxel_core::debug::caves::{self, CaveMask};
 use voxel_core::debug::report;
-use voxel_core::terrain::{capsule, mc};
+use voxel_core::terrain::{capsule, mc, tube};
 use voxel_core::{Carver, Env, RenderConfig, WorldSize};
 
 /// Chunks per side. Big enough that a connected tunnel system can span several
@@ -44,7 +44,11 @@ fn main() {
     // rows are comparable to the enum-driven ones below.
     /// A carver callable directly, for the two not yet behind `Carver`.
     type CarveFn = fn(&mut voxel_core::world::Chunk, u32) -> u64;
-    let direct: [(&str, CarveFn); 2] = [("mc", mc::carve), ("capsule", capsule::carve)];
+    let direct: [(&str, CarveFn); 3] = [
+        ("mc", mc::carve),
+        ("capsule", capsule::carve),
+        ("tube", tube::carve),
+    ];
     for (name, carve) in direct {
         let hm = voxel_core::terrain::heightmap::HeightMap::fitted_to_world(1337, SIDE * 16);
         let mut grid = voxel_core::world::ChunkGrid::new(SIDE, SIDE, SIDE);
@@ -63,7 +67,15 @@ fn main() {
             stats.largest_component_share() * 100.0,
             stats.components, stats.trunk_length, ms,
         );
-        println!("{:<9} noise samples: {samples}", "");
+        println!(
+            "{:<9} samples: {samples} | depth/col {:.2} max_col {} mean_col {:.1} sv {:.3} | tunnels={}",
+            "",
+            stats.depth_per_column,
+            stats.max_column_height,
+            stats.mean_column_height,
+            stats.surface_to_volume(),
+            stats.looks_like_tunnels()
+        );
     }
 
     for carver in ALL {
