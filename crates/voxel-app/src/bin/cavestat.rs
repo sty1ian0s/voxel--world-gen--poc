@@ -21,6 +21,15 @@ const SIDE: u32 = 8;
 
 const ALL: [Carver; 2] = [Carver::Density, Carver::Sparse];
 
+/// Display name for a cave type, matching the wiki's lowercase spelling.
+fn cave_type_name(t: tube::CaveType) -> &'static str {
+    match t {
+        tube::CaveType::Cheese => "cheese",
+        tube::CaveType::Spaghetti => "spaghetti",
+        tube::CaveType::Noodle => "noodle",
+    }
+}
+
 fn main() {
     let params = CaveParams {
         origin_density: 2.0,
@@ -74,6 +83,45 @@ fn main() {
             stats.max_column_height,
             stats.mean_column_height,
             stats.surface_to_volume(),
+            stats.looks_like_tunnels()
+        );
+    }
+
+    // Each MC noise cave type on its own, so its size and width can be checked
+    // against the wiki's description of that type rather than only the sum.
+    // `carve_types` takes a third argument, so it cannot join the table above.
+    for cave_type in tube::CaveType::ALL {
+        let types = tube::CaveType::ALL.map(|t| {
+            let c = t.cutoffed();
+            if t == cave_type { c } else { c.cutoff(0.0) }
+        });
+        let name = format!("  {}", cave_type_name(cave_type));
+        let hm = voxel_core::terrain::heightmap::HeightMap::fitted_to_world(1337, SIDE * 16);
+        let mut grid = voxel_core::world::ChunkGrid::new(SIDE, SIDE, SIDE);
+        let start = std::time::Instant::now();
+        let mut samples = 0u64;
+        for pos in grid.positions().collect::<Vec<_>>() {
+            let c = grid.get_mut(pos);
+            voxel_core::terrain::generate_surface(c, pos, &hm);
+            samples += tube::carve_types(c, 1337, &types);
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let stats = caves::measure(&grid, SIDE as i32, CaveMask::Underground);
+        println!(
+            "{:<9} {:>6.1}% {:>12.1}% {:>11} {:>7} {:>9.1}",
+            name,
+            stats.void_fraction() * 100.0,
+            stats.largest_component_share() * 100.0,
+            stats.components,
+            stats.trunk_length,
+            ms,
+        );
+        println!(
+            "{:<9} samples: {samples} | depth/col {:.2} max_col {} mean_col {:.1} | tunnels={}",
+            "",
+            stats.depth_per_column,
+            stats.max_column_height,
+            stats.mean_column_height,
             stats.looks_like_tunnels()
         );
     }
