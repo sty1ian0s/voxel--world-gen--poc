@@ -185,6 +185,40 @@ pub const NOODLE_OCTAVES: i32 = 4;
 pub const NOODLE_EPSILON: f32 = 0.11;
 pub const NOODLE_RADIUS: f32 = 2.0;
 
+/// Noise pillars: the level-set machinery read through a sharp selection gate,
+/// giving stone columns a few blocks across.
+///
+/// The wiki's noise pillars are "vertical stone formations" a "few blocks in
+/// diameter" standing inside a cave — narrow in `xz`, tall in `y`, which is the
+/// opposite aspect to every other type here. That is why this one needs
+/// [`TypeConfig::taper`] rather than another epsilon: epsilon alone can only
+/// narrow the band, and narrowing the band narrows the *height* with it.
+///
+/// Frequency and octaves are noodle's. The taper gate leaves only a thin
+/// neighbourhood of the level set, so the surviving set is dominated by the
+/// field's fine detail anyway, and a separate frequency was measured to change
+/// nothing but the count (the value distribution is scale-free).
+pub const PILLAR_FREQUENCY: f32 = 0.055;
+/// Four octaves, matching noodle: the gate samples a narrow band around the
+/// level set, so it is the high-frequency detail that decides membership.
+pub const PILLAR_OCTAVES: i32 = 4;
+/// Twice noodle's epsilon. The gate keeps only `(1 - |band|/epsilon)^taper >=
+/// 0.5`, i.e. `|band| <= epsilon * (1 - 0.5^(1/taper))`, which at
+/// [`PILLAR_TAPER`] is `epsilon * 0.0424` — so the *effective* band is far
+/// narrower than epsilon suggests. This value was chosen to land the column
+/// density at a few per thousand columns; see the module docs for the sweep.
+pub const PILLAR_EPSILON: f32 = 0.22;
+/// Taller than every other type: a pillar is a full-height column, and this is
+/// the half-height the survivors get. It must be large enough to read as a
+/// standing column rather than a stub, and the gate is what keeps columns thin,
+/// not this.
+pub const PILLAR_RADIUS: f32 = 7.0;
+/// The selection exponent. At 16 the effective band is `epsilon * 0.0424`, and
+/// the resulting `xz` footprint measures 1-4 voxels across, which is the wiki's
+/// "few blocks in diameter". Lower values make thickets rather than pillars;
+/// higher ones thin the field out until pillars become rare.
+pub const PILLAR_TAPER: f32 = 16.0;
+
 /// Spacing of the sampling lattice in voxels, shared by all three types.
 ///
 /// The lattice sets the cost: a chunk spans 16 voxels and this spacing is 26,
@@ -205,11 +239,70 @@ pub enum CaveType {
     Spaghetti,
     /// Noodle caves: the same band, thinner and squigglier.
     Noodle,
+    /// Noise pillars: stone columns standing inside a cave, a few blocks
+    /// across.
+    ///
+    /// This is the one type that is *not* a band shape. It is the same
+    /// level-set machinery read through [`TypeConfig::taper`], which gates
+    /// selection sharply and then gives the survivors the full radius, so the
+    /// result is narrow in `xz` and tall in `y` — a column rather than a slice.
+    ///
+    /// The wiki describes noise pillars as "a few blocks in diameter", and
+    /// [`PILLAR_TAPER`] is tuned to land the `xz` footprint in that range.
+    Pillar,
 }
 
 impl CaveType {
-    /// All three, in the order [`carve`] ORs them.
+    /// The three MC *noise* cave types, in the order [`carve`] ORs them.
+    ///
+    /// These are the default world. They are exactly the three types the wiki
+    /// describes as noise caves, and they are what
+    /// [`looks_like_tunnels`](crate::debug::caves::CaveStats::looks_like_tunnels)
+    /// is calibrated against: all three are band shapes, so their union is
+    /// still tunnel-like (measured 99.2% connectivity, `tunnels=true`).
+    ///
+    /// [`Self::Pillar`] is deliberately **not** here. A pillar is a full-height
+    /// column, so including it drags the union's `max_col` past the yardstick's
+    /// limit and the union stops reading as tunnels — correctly, because it is
+    /// then no longer only tunnels. It is opt-in per region instead, which is
+    /// also the honest description of MC: pillars are a feature *inside* caves,
+    /// not a fourth cave system alongside the three.
+    ///
+    /// [`Self::ALL_TYPES`] is the complete set, for code that must stay correct
+    /// as types are added rather than code describing the default world.
     pub const ALL: [Self; 3] = [Self::Cheese, Self::Spaghetti, Self::Noodle];
+
+    /// Every cave type, default or not.
+    pub const ALL_TYPES: [Self; 4] = [Self::Cheese, Self::Spaghetti, Self::Noodle, Self::Pillar];
+
+    /// How many type slots `carve_types` accepts.
+    ///
+    /// Derived from [`Self::ALL_TYPES`], so adding a type without widening the
+    /// signature — or widening it without adding the type — is a compile error
+    /// rather than a silently ignored slot.
+    pub const COUNT: usize = Self::ALL_TYPES.len();
+
+    /// The default world's configuration, in slot order, with the non-default
+    /// types present but disabled.
+    ///
+    /// This is what [`carve`] passes. A disabled slot costs nothing —
+    /// `Lattice::sample` returns before building any generator — so carrying
+    /// them is free, and it keeps every slot meaningful instead of leaving a
+    /// caller to wonder what an absent field means.
+    ///
+    /// `epsilon == 0.0` is the documented "off" for a type, so this reuses the
+    /// same switch the tests and `carve_types` use rather than inventing a
+    /// second one.
+    pub fn default_configs() -> [TypeConfig; Self::COUNT] {
+        Self::ALL_TYPES.map(|t| {
+            let c = t.cutoffed();
+            if Self::ALL.contains(&t) {
+                c
+            } else {
+                c.cutoff(0.0)
+            }
+        })
+    }
 
     /// Field id passed to [`cave_2d`]. Each type owns two consecutive ids — its
     /// band field and its depth field — so no two types can share a field.
@@ -218,25 +311,44 @@ impl CaveType {
             Self::Cheese => 0,
             Self::Spaghetti => 2,
             Self::Noodle => 4,
+            Self::Pillar => 6,
         }
     }
 
     /// This type's tuned configuration.
     pub const fn cutoffed(self) -> TypeConfig {
-        let (frequency, octaves, epsilon, radius) = match self {
+        let (frequency, octaves, epsilon, radius, taper) = match self {
             Self::Cheese => (
                 CHEESE_FREQUENCY,
                 CHEESE_OCTAVES,
                 CHEESE_EPSILON,
                 CHEESE_RADIUS,
+                1.0,
             ),
             Self::Spaghetti => (
                 SPAGHETTI_FREQUENCY,
                 SPAGHETTI_OCTAVES,
                 SPAGHETTI_EPSILON,
                 SPAGHETTI_RADIUS,
+                1.0,
             ),
-            Self::Noodle => (NOODLE_FREQUENCY, NOODLE_OCTAVES, NOODLE_EPSILON, NOODLE_RADIUS),
+            // The three noise cave types keep `taper = 1.0`, which makes
+            // `interval_for` skip the pillar gate entirely and take the
+            // original arithmetic. Their measured shape is pinned by tests.
+            Self::Noodle => (
+                NOODLE_FREQUENCY,
+                NOODLE_OCTAVES,
+                NOODLE_EPSILON,
+                NOODLE_RADIUS,
+                1.0,
+            ),
+            Self::Pillar => (
+                PILLAR_FREQUENCY,
+                PILLAR_OCTAVES,
+                PILLAR_EPSILON,
+                PILLAR_RADIUS,
+                PILLAR_TAPER,
+            ),
         };
         TypeConfig {
             cave_type: self,
@@ -244,6 +356,7 @@ impl CaveType {
             octaves,
             epsilon,
             radius,
+            taper,
         }
     }
 
@@ -271,6 +384,26 @@ pub struct TypeConfig {
     pub epsilon: f32,
     /// Mean interval half-height in voxels, scaled down toward the band edge.
     pub radius: f32,
+    /// The level-set taper exponent, and the switch that turns a band into a
+    /// **pillar**.
+    ///
+    /// At `1.0` the interval height is `radius * 1 - |band|/epsilon`, exactly
+    /// the shape the three noise cave types have always had: a column carves a
+    /// slice whose height falls off toward the band edge, so the carve tapers
+    /// into stone. `x.powf(1.0) == x` bitwise, so `1.0` is not merely close to
+    /// the old formula, it *is* the old formula.
+    ///
+    /// Above `1.0` the taper instead gates *selection*: only columns with
+    /// `(1 - |band|/epsilon)^taper >= 0.5` qualify, and every survivor is given
+    /// the **full** radius. That is what makes a pillar rather than a thin
+    /// slice. Height and footprint are otherwise welded together — `width`
+    /// scales both — so sharpening the height alone just collapses the column
+    /// (measured `max_col` 12 -> 8) instead of narrowing it. Decoupling them is
+    /// the whole trick, and it is why the gate sets `width` back to 1.0.
+    ///
+    /// The effective band is `epsilon * (1 - 0.5^(1/taper))`, so taper and
+    /// epsilon trade off against each other and must be tuned as a pair.
+    pub taper: f32,
 }
 
 impl TypeConfig {
@@ -282,6 +415,13 @@ impl TypeConfig {
     /// The same type with a different band width, so a sweep changes one number.
     pub const fn cutoff(self, epsilon: f32) -> Self {
         Self { epsilon, ..self }
+    }
+
+    /// The same type with a different taper exponent, so a sweep changes one
+    /// number. `1.0` restores the tapering band; above that the type becomes a
+    /// pillar.
+    pub const fn tapered(self, taper: f32) -> Self {
+        Self { taper, ..self }
     }
 
     /// The band field generator for this configuration.
@@ -475,9 +615,26 @@ pub(crate) fn interval_for(corner: Corner, config: &TypeConfig) -> Interval {
         return Interval::EMPTY;
     }
     // Scaled by the band: 1 at the level set, 0 at the band edge.
-    let width = 1.0 - (corner.band.abs() / config.epsilon).min(1.0);
+    let mut width = 1.0 - (corner.band.abs() / config.epsilon).min(1.0);
     if width <= 0.0 {
         return Interval::EMPTY;
+    }
+    // The pillar gate. Above taper 1.0 only columns inside a sharpened core
+    // qualify, and each survivor then gets the FULL radius rather than a
+    // tapered slice — the two changes together are what turn a band into a
+    // standing column. Gating without the reset would just narrow the slice,
+    // and resetting without the gate would thicken every column in the band.
+    //
+    // The guard is `> 1.0` rather than `>= 1.0` on purpose: the three noise
+    // cave types carry taper 1.0 and must take the original arithmetic below
+    // untouched, which keeps their measured shape pinned. `x.powf(1.0) == x`
+    // bitwise, so even the branch-free version would agree — the guard is there
+    // to make that a structural fact rather than an arithmetic coincidence.
+    if config.taper > 1.0 {
+        if width.powf(config.taper) < 0.5 {
+            return Interval::EMPTY;
+        }
+        width = 1.0;
     }
     Interval {
         centre: band_centre() + corner.depth * DEPTH_AMPLITUDE,
@@ -490,7 +647,7 @@ pub(crate) fn interval_for(corner: Corner, config: &TypeConfig) -> Interval {
 /// Returns the number of 2D noise samples taken, so the cost claim is auditable
 /// by a test rather than asserted in a comment: two per lattice corner per type.
 pub fn carve(chunk: &mut impl CarveTarget, seed: u32) -> u64 {
-    carve_types(chunk, seed, &CaveType::ALL.map(|t| t.cutoffed()))
+    carve_types(chunk, seed, &CaveType::default_configs())
 }
 
 /// [`carve`] with explicit per-type configurations, so one cave type can be
@@ -499,7 +656,11 @@ pub fn carve(chunk: &mut impl CarveTarget, seed: u32) -> u64 {
 /// Mirrors [`super::mc::carve_fields`]: the configuration under test is the
 /// caller's, never a module default read back inside, so a test that isolates
 /// cheese is genuinely judged on cheese alone.
-pub fn carve_types(chunk: &mut impl CarveTarget, seed: u32, types: &[TypeConfig; 3]) -> u64 {
+pub fn carve_types(
+    chunk: &mut impl CarveTarget,
+    seed: u32,
+    types: &[TypeConfig; CaveType::COUNT],
+) -> u64 {
     // Built once per chunk, not once per column: two generators per type.
     let lattices = types.map(|config| Lattice::sample(chunk.pos(), seed, &config));
     // Two fields per corner, nine corners per ENABLED type. Exact, not an
@@ -518,7 +679,11 @@ pub fn carve_types(chunk: &mut impl CarveTarget, seed: u32, types: &[TypeConfig;
 
             // One interval per type, unioned: this is where a column can carry
             // a wide cheese interval and a thin noodle interval at once.
-            let intervals = [0, 1, 2].map(|i| interval_for(lattices[i].at(wx, wz), &types[i]));
+            //
+            // Sized from `lattices` rather than written as a literal list, so
+            // adding a type to `CaveType::ALL` cannot silently leave it out.
+            let intervals: [Interval; CaveType::COUNT] =
+                std::array::from_fn(|i| interval_for(lattices[i].at(wx, wz), &types[i]));
 
             let mut lo = i32::MAX;
             let mut hi = i32::MIN;
@@ -554,11 +719,17 @@ pub fn carve_types(chunk: &mut impl CarveTarget, seed: u32, types: &[TypeConfig;
 /// ordering. The lattice covering the voxel's chunk is rebuilt from the world
 /// coordinate alone.
 pub fn cave_at(seed: u32, wx: i32, wy: i32, wz: i32) -> bool {
-    cave_type_at(seed, wx, wy, wz, &CaveType::ALL.map(|t| t.cutoffed()))
+    cave_type_at(seed, wx, wy, wz, &CaveType::default_configs())
 }
 
 /// [`cave_at`] with explicit per-type configurations, for isolating one type.
-pub fn cave_type_at(seed: u32, wx: i32, wy: i32, wz: i32, types: &[TypeConfig; 3]) -> bool {
+pub fn cave_type_at(
+    seed: u32,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+    types: &[TypeConfig; CaveType::COUNT],
+) -> bool {
     let pos = ChunkPos::from_world(wx, wy, wz);
     let lattices = types.map(|config| Lattice::sample(pos, seed, &config));
     let y = wy as f32 + 0.5;
@@ -572,12 +743,12 @@ pub fn cave_type_at(seed: u32, wx: i32, wy: i32, wz: i32, types: &[TypeConfig; 3
 ///
 /// Mirrors the other carvers' measurement so the numbers sit side by side.
 pub fn carve_fraction(seed: u32, side: i32) -> f64 {
-    carve_fraction_types(seed, side, &CaveType::ALL.map(|t| t.cutoffed()))
+    carve_fraction_types(seed, side, &CaveType::default_configs())
 }
 
 /// [`carve_fraction`] for an explicit set of per-type configurations, so each
 /// cave type can be measured alone and each knob swept and reported.
-pub fn carve_fraction_types(seed: u32, side: i32, types: &[TypeConfig; 3]) -> f64 {
+pub fn carve_fraction_types(seed: u32, side: i32, types: &[TypeConfig; CaveType::COUNT]) -> f64 {
     use crate::domain::CHUNK_VOLUME;
     use crate::terrain::{generate_surface, heightmap::HeightMap};
     use crate::world::Chunk;
@@ -656,7 +827,7 @@ mod tests {
     /// fraction reported here and the carve fraction reported there describe
     /// the same world and can be quoted together. `cavestat` builds a taller
     /// world (`SIDE * 16` voxels) and its numbers are the taller one's.
-    fn world(types: &[TypeConfig; 3]) -> caves::CaveStats {
+    fn world(types: &[TypeConfig; CaveType::COUNT]) -> caves::CaveStats {
         let hm = HeightMap::fitted_to_world(SEED, crate::terrain::heightmap::BASE_Y as u32);
         let mut grid = ChunkGrid::new(SIDE, SIDE, SIDE);
         for pos in grid.positions().collect::<Vec<_>>() {
@@ -672,8 +843,8 @@ mod tests {
     /// "Off" is an empty band: `epsilon = 0` makes `interval_for` return
     /// `EMPTY` for every column, so a disabled type carves nothing without
     /// needing a separate code path.
-    fn only(cave_type: CaveType) -> [TypeConfig; 3] {
-        let mut types = CaveType::ALL.map(|t| t.cutoffed());
+    fn only(cave_type: CaveType) -> [TypeConfig; CaveType::COUNT] {
+        let mut types = CaveType::ALL_TYPES.map(|t| t.cutoffed());
         for t in &mut types {
             if t.cave_type != cave_type {
                 *t = t.cutoff(0.0);
@@ -720,6 +891,110 @@ mod tests {
         ChunkPos::new(cx, band.start + 1, cz)
     }
 
+    /// The pillar type is a **column**, which is the opposite aspect to every
+    /// other type here, and this pins both halves of that.
+    ///
+    /// Height: a selected column must carve the full radius rather than the
+    /// tapered slice the band types produce, so its depth is ~2x the radius.
+    /// Width: the selection must be narrow, so of the columns in the sampled
+    /// span only a small fraction may carve at all.
+    ///
+    /// Both are asserted against a real carve, not against the selection
+    /// predicate. An earlier throwaway probe of this feature reported a clean
+    /// "0.00% void" on every setting because it clipped a world-Y interval to
+    /// chunk-local coordinates, and a footprint-only assertion would have
+    /// passed on that empty world.
+    #[test]
+    fn a_pillar_is_a_narrow_full_height_column() {
+        let stats = world(&only(CaveType::Pillar));
+        assert!(
+            stats.cave_voxels > 0,
+            "the pillar type carved nothing at all: {}",
+            stats.summary()
+        );
+        // Full height, not a tapered slice: the band types sit near 2-8.
+        assert!(
+            stats.mean_column_height >= 8.0,
+            "pillar columns are not standing up (mean_col {:.2}, expected >= 8)",
+            stats.mean_column_height
+        );
+        // Narrow: the pillar's share of columns must stay well below the band
+        // types, or it stopped being a pillar and became a thicket.
+        let pillar_share = stats.void_fraction();
+        let cheese_share = world(&only(CaveType::Cheese)).void_fraction();
+        assert!(
+            pillar_share < cheese_share,
+            "pillars ({pillar_share:.4}) are not narrower than cheese ({cheese_share:.4})"
+        );
+    }
+
+    /// The gate is what makes a pillar, and turning it off must restore the
+    /// plain band shape.
+    ///
+    /// This is the backward-compatibility guarantee for the three noise cave
+    /// types, stated as behaviour rather than as arithmetic: with `taper` back
+    /// at 1.0 the pillar type must carve like the band machinery does, i.e.
+    /// tapered slices with a low mean column height. It also guards the
+    /// `> 1.0` comparison — a `>= 1.0` would run the gate at taper 1.0 and
+    /// silently reshape every existing type.
+    #[test]
+    fn a_taper_of_one_restores_the_tapered_band_shape() {
+        let gated = world(&only(CaveType::Pillar));
+        let ungated = world(&only(CaveType::Pillar).map(|t| t.tapered(1.0)));
+        // The gate's real effect is on *selection*, so the honest assertions are
+        // about how much is carved and how finely it is split.
+        //
+        // `mean_column_height` is deliberately NOT used here: it averages the
+        // largest component's columns, and at taper 1.0 the band merges into a
+        // few large components whose columns span the whole band, so it
+        // measures *higher* (7.53) than the gated case. Asserting on it was
+        // this test's first version, and it failed — which is the only reason
+        // the mistake is not still in here.
+        assert!(
+            ungated.cave_voxels > gated.cave_voxels,
+            "taper 1.0 should carve more than the gate: {} vs {}",
+            ungated.cave_voxels,
+            gated.cave_voxels
+        );
+        // The gate splits the field into many separate columns; the band is a
+        // few large connected sheets.
+        assert!(
+            gated.components > ungated.components,
+            "the gate should fragment the field into columns: {} vs {}",
+            gated.components,
+            ungated.components
+        );
+        // Every gated survivor stands at the full radius.
+        assert!(
+            gated.mean_column_height >= 8.0,
+            "the gate must hand survivors the full radius: {:.2}",
+            gated.mean_column_height
+        );
+    }
+
+    /// A disabled pillar must carve nothing and cost nothing, exactly like the
+    /// other types. The sample count is the half that matters: a type that
+    /// cannot carve but still builds generators makes every per-type cost row
+    /// read the same as the combined one.
+    #[test]
+    fn a_disabled_pillar_carves_nothing_and_costs_nothing() {
+        let off = only(CaveType::Pillar)
+            .map(|t| if t.cave_type == CaveType::Pillar { t.cutoff(0.0) } else { t });
+        // Nothing at all is enabled, so nothing may be carved or sampled.
+        let mut chunk = generated(cave_band_chunk(2, 3));
+        assert_eq!(
+            carve_types(&mut chunk, SEED, &off),
+            0,
+            "a fully disabled carver must take zero samples"
+        );
+        let stats = world(&off);
+        assert_eq!(
+            stats.cave_voxels, 0,
+            "a fully disabled carver must carve nothing: {}",
+            stats.summary()
+        );
+    }
+
     #[test]
     fn carving_only_ever_turns_solid_into_air() {
         let mut chunk = generated(cave_band_chunk(2, 1));
@@ -764,7 +1039,7 @@ mod tests {
         let chunk_count = 4 * 2 * 4;
         assert_eq!(
             total,
-            18 * 3 * chunk_count,
+            18 * CaveType::ALL.len() as u64 * chunk_count,
             "expected 18 samples per chunk per type (9 corners x band+depth)"
         );
         // And far below the per-column cost, which is the point of the design:
@@ -810,6 +1085,65 @@ mod tests {
         }
     }
 
+    /// `carve_types` and `cave_type_at` must agree voxel for voxel **for every
+    /// type**, pillars included.
+    ///
+    /// The combined test above would still pass if a type were silently left
+    /// out of one of the two paths, because both would be equally wrong. This
+    /// one isolates each type, so a type that is carved but not queryable (or
+    /// the reverse) fails here.
+    #[test]
+    fn the_per_type_query_agrees_with_the_carver_for_every_type() {
+        for cave_type in CaveType::ALL_TYPES {
+            let types = only(cave_type);
+            let mut carved = 0u64;
+            // Several chunks, because the pillar type is deliberately sparse
+            // (0.5% void) and a single chunk often contains none of it. The
+            // vacuity assertion below is what forces this search to be wide
+            // enough to be meaningful.
+            for pos in [
+                cave_band_chunk(2, 2),
+                cave_band_chunk(3, 1),
+                cave_band_chunk(1, 3),
+                cave_band_chunk(4, 4),
+                cave_band_chunk(0, 0),
+                cave_band_chunk(5, 2),
+                cave_band_chunk(2, 5),
+                cave_band_chunk(6, 6),
+            ] {
+                let mut chunk = generated(pos);
+                let original = chunk.clone();
+                carve_types(&mut chunk, SEED, &types);
+                let (ox, oy, oz) = chunk.pos().origin();
+                for i in 0..CHUNK_VOLUME as u16 {
+                    let idx = unsafe { VoxelIndex::from_raw_unchecked(i) };
+                    let (wx, wy, wz) = (
+                        ox + idx.x() as i32,
+                        oy + idx.y() as i32,
+                        oz + idx.z() as i32,
+                    );
+                    if original.block(idx).is_air() {
+                        continue;
+                    }
+                    let now_air = chunk.block(idx).is_air();
+                    if now_air {
+                        carved += 1;
+                    }
+                    assert_eq!(
+                        now_air,
+                        cave_type_at(SEED, wx, wy, wz, &types),
+                        "{cave_type:?} chunk and query disagree at {wx},{wy},{wz}"
+                    );
+                }
+            }
+            assert!(
+                carved > 0,
+                "{cave_type:?} carved nothing across every sampled chunk, so the \
+                 agreement above was vacuous"
+            );
+        }
+    }
+
     /// The property the design exists for: any voxel is answerable in isolation.
     ///
     /// A walked carver cannot satisfy this, because its `n`-th position depends
@@ -841,7 +1175,7 @@ mod tests {
     /// Measured, and the numbers are pinned by the shape test below.
     #[test]
     fn each_cave_type_carves_alone() {
-        for cave_type in CaveType::ALL {
+        for cave_type in CaveType::ALL_TYPES {
             let pct = carve_fraction_types(SEED, 4, &only(cave_type));
             println!("{:?} alone carves {pct:.2}% of rock", cave_type);
             assert!(
@@ -857,7 +1191,7 @@ mod tests {
     /// particular column happens to carry two depends on the seed.
     #[test]
     fn a_column_can_carry_intervals_of_more_than_one_type() {
-        let types = CaveType::ALL.map(|t| t.cutoffed());
+        let types = CaveType::default_configs();
         let lattices = types.map(|c| Lattice::sample(ChunkPos::ORIGIN, SEED, &c));
         let mut both = 0;
         let mut checked = 0;
@@ -884,7 +1218,7 @@ mod tests {
     }
 
     /// Same fixture as `cavestat`: 8x8x8 chunks on the `SIDE * 16` heightmap.
-    fn cavestat_world(types: &[TypeConfig; 3]) -> caves::CaveStats {
+    fn cavestat_world(types: &[TypeConfig; CaveType::COUNT]) -> caves::CaveStats {
         let hm = HeightMap::fitted_to_world(SEED, SIDE * 16);
         let mut grid = ChunkGrid::new(SIDE, SIDE, SIDE);
         for pos in grid.positions().collect::<Vec<_>>() {
@@ -898,14 +1232,14 @@ mod tests {
     #[test]
     #[ignore]
     fn print_cavestat_table() {
-        for cave_type in CaveType::ALL {
+        for cave_type in CaveType::ALL_TYPES {
             let st = cavestat_world(&only(cave_type));
             println!("{:?}: void {:.2}% conn {:.1}% comp {} mean_col {:.2} max_col {} depth/col {:.2} sv {:.3} tunnels={}",
                 cave_type, st.void_fraction()*100.0, st.largest_component_share()*100.0,
                 st.components, st.mean_column_height, st.max_column_height,
                 st.depth_per_column, st.surface_to_volume(), st.looks_like_tunnels());
         }
-        let st = cavestat_world(&CaveType::ALL.map(|t| t.cutoffed()));
+        let st = cavestat_world(&CaveType::default_configs());
         println!("combined: void {:.2}% conn {:.1}% comp {} mean_col {:.2} max_col {} depth/col {:.2} sv {:.3} tunnels={}",
             st.void_fraction()*100.0, st.largest_component_share()*100.0,
             st.components, st.mean_column_height, st.max_column_height,
@@ -918,7 +1252,7 @@ mod tests {
         // A pillar = a stone voxel with air on all four lateral sides, which is
         // stone standing inside a cavity. Measured, because "the carver might
         // leave one" is a guess until counted.
-        let types = CaveType::ALL.map(|t| t.cutoffed());
+        let types = CaveType::default_configs();
         let hm = HeightMap::fitted_to_world(SEED, SIDE * 16);
         let mut grid = ChunkGrid::new(SIDE, SIDE, SIDE);
         for pos in grid.positions().collect::<Vec<_>>() {
@@ -983,13 +1317,57 @@ mod tests {
         }
     }
 
+    /// `ALL` is the default world, and it must stay exactly the three MC noise
+    /// cave types.
+    ///
+    /// This guards a deliberate decision. Including pillars in the default
+    /// union pushed the combined carver's `max_col` from 17 to 26 and flipped
+    /// its shape verdict from `tunnels=true` to `tunnels=false` — correctly, a
+    /// union containing full-height columns is no longer only tunnels. Adding a
+    /// fourth type to `ALL` would silently reintroduce that, so the default set
+    /// is pinned here and new types belong in `ALL_TYPES`.
+    ///
+    /// It pins the flip side too: a type in `ALL_TYPES` but missing from
+    /// `default_configs` would be a type nobody ever carves.
+    #[test]
+    fn the_default_world_is_the_three_noise_cave_types() {
+        assert_eq!(
+            CaveType::ALL,
+            [CaveType::Cheese, CaveType::Spaghetti, CaveType::Noodle],
+            "the default world changed; pillars are opt-in on purpose"
+        );
+        assert!(
+            CaveType::ALL_TYPES.len() > CaveType::ALL.len(),
+            "ALL_TYPES must be the superset that includes the opt-in types"
+        );
+        for t in CaveType::ALL {
+            assert!(
+                CaveType::ALL_TYPES.contains(&t),
+                "{t:?} is in the default set but missing from ALL_TYPES"
+            );
+        }
+        assert!(
+            !CaveType::ALL.contains(&CaveType::Pillar),
+            "pillars must not be in the default world"
+        );
+        // The disabled slots must really be off, or "opt-in" is a comment
+        // rather than a behaviour.
+        for (c, t) in CaveType::default_configs().iter().zip(CaveType::ALL_TYPES) {
+            assert_eq!(
+                c.epsilon > 0.0,
+                CaveType::ALL.contains(&t),
+                "{t:?} default-enabled state does not match ALL"
+            );
+        }
+    }
+
     /// The measurement the module doc quotes. Prints the per-type and combined
     /// statistics so the numbers are reported rather than merely bounded, and
     /// asserts the relations that justify the design.
     #[test]
     fn the_three_types_have_the_measured_shape() {
         let mut rows = Vec::new();
-        for cave_type in CaveType::ALL {
+        for cave_type in CaveType::ALL_TYPES {
             let stats = world(&only(cave_type));
             println!(
                 "{:?} alone: {} | mean_col {:.2} max_col {} depth/col {:.2}",
@@ -1001,12 +1379,22 @@ mod tests {
             );
             rows.push((cave_type, stats));
         }
-        let combined = world(&CaveType::ALL.map(|t| t.cutoffed()));
+        let combined = world(&CaveType::default_configs());
         println!("combined: {}", combined.summary());
 
         // Every type is shaped like tunnels or rooms, not like a slab. This is
         // the yardstick's smoke test, and it is deliberately loose.
+        //
+        // Pillars are excluded deliberately, and the exclusion is the point
+        // rather than an inconvenience: `looks_like_tunnels` requires
+        // `depth_per_column >= 2`, and a pillar is a full-height column, which
+        // has a depth of exactly 1 by construction. Asserting tunnels here
+        // would demand that pillars *not* be pillars. Their shape is pinned by
+        // `a_pillar_is_a_narrow_full_height_column` instead.
         for (cave_type, stats) in &rows {
+            if *cave_type == CaveType::Pillar {
+                continue;
+            }
             assert!(
                 stats.looks_like_tunnels(),
                 "{cave_type:?} does not pass looks_like_tunnels: {}",
@@ -1086,7 +1474,7 @@ mod tests {
     /// rule stated without the range-skipping optimisation the carver uses.
     #[test]
     fn a_voxel_is_carved_exactly_when_a_type_interval_contains_it() {
-        let types = CaveType::ALL.map(|t| t.cutoffed());
+        let types = CaveType::default_configs();
         let mut disagreeing = 0;
         let mut checked = 0;
         for wy in 12..46 {
@@ -1251,37 +1639,44 @@ mod tests {
     /// types together (the bug this test exists to prevent).
     #[test]
     fn a_zero_epsilon_type_carves_nothing_and_costs_nothing() {
-        let mut all = CaveType::ALL.map(|t| t.cutoffed());
-        all[1] = all[1].cutoff(0.0);
-        let a = carve_fraction_types(SEED, 4, &[all[0], all[1], all[2].cutoff(0.0)]);
+        let mut off = CaveType::default_configs();
+        off[1] = off[1].cutoff(0.0);
+        off[2] = off[2].cutoff(0.0);
+        off[3] = off[3].cutoff(0.0);
+        let a = carve_fraction_types(SEED, 4, &off);
         let b = carve_fraction_types(SEED, 4, &only(CaveType::Cheese));
         assert!(
             (a - b).abs() < 1e-9,
             "a zero epsilon did not disable the type: {a:.4}% vs {b:.4}%"
         );
 
-        // Sample counts: 18 per enabled type per chunk. One type on = 18, all
-        // three on = 54. A disabled type must not be counted or sampled.
+        // Sample counts: 18 per enabled type per chunk. Written against
+        // `CaveType::ALL.len()` rather than literals so adding a type cannot
+        // silently make this test assert a stale total.
+        let per_type = 18;
+        let n = CaveType::ALL.len();
         let mut chunk = generated(ChunkPos::new(1, 1, 1));
         assert_eq!(
             carve_types(&mut chunk, SEED, &only(CaveType::Cheese)),
-            18,
-            "a single enabled type must take 18 samples, not the cost of three"
+            per_type,
+            "a single enabled type must take 18 samples, not the cost of several"
         );
         let mut chunk = generated(ChunkPos::new(1, 1, 1));
         assert_eq!(
             carve(&mut chunk, SEED),
-            54,
-            "all three types must take 18 samples each"
+            per_type * n as u64,
+            "every type must take 18 samples each"
         );
-        // Two enabled types, one disabled: cheese and spaghetti on, noodle off.
-        let mut two = CaveType::ALL.map(|t| t.cutoffed());
-        two[2] = two[2].cutoff(0.0);
+        // Two enabled types, the rest disabled.
+        let mut two = CaveType::default_configs();
+        for t in two.iter_mut().skip(2) {
+            *t = t.cutoff(0.0);
+        }
         let mut chunk = generated(ChunkPos::new(1, 1, 1));
         assert_eq!(
             carve_types(&mut chunk, SEED, &two),
-            36,
-            "two enabled types must take 36 samples"
+            per_type * 2,
+            "two enabled types must take twice the single-type count"
         );
     }
 }

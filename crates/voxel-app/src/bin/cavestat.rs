@@ -27,6 +27,7 @@ fn cave_type_name(t: tube::CaveType) -> &'static str {
         tube::CaveType::Cheese => "cheese",
         tube::CaveType::Spaghetti => "spaghetti",
         tube::CaveType::Noodle => "noodle",
+        tube::CaveType::Pillar => "pillar",
     }
 }
 
@@ -90,8 +91,12 @@ fn main() {
     // Each MC noise cave type on its own, so its size and width can be checked
     // against the wiki's description of that type rather than only the sum.
     // `carve_types` takes a third argument, so it cannot join the table above.
-    for cave_type in tube::CaveType::ALL {
-        let types = tube::CaveType::ALL.map(|t| {
+    // Every type, pillars included. The point of this loop is to check each
+    // type against the wiki's description of it, so a type left out here would
+    // be a type nobody ever measured. Note this covers `ALL_TYPES`, not `ALL`:
+    // pillars are opt-in for generation but must still be measured.
+    for cave_type in tube::CaveType::ALL_TYPES {
+        let types = tube::CaveType::ALL_TYPES.map(|t| {
             let c = t.cutoffed();
             if t == cave_type { c } else { c.cutoff(0.0) }
         });
