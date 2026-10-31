@@ -1,4 +1,4 @@
-//! Per-chunk carve latency distribution: p50/p90/p99/p99.9 for both carvers.
+//! Per-chunk carve latency: p50/p90/p99/p99.9 for MC's approach against ours.
 //!
 //! `benches/carvers.rs` uses criterion, which is the right tool for comparing
 //! means and for reporting a confidence interval on them, but it deliberately
@@ -11,31 +11,39 @@
 //! samples per carver for p99.9 to mean something: the 99.9th percentile of
 //! 5000 samples is the 5th worst, which is thin but far better than the mean.
 //!
-//! The spread is expected to be much wider for `sparse` than for `density`.
-//! Density samples the same 4096 voxels every chunk, so its per-chunk cost is
-//! near-constant; sparse enumerates 27 regions and stamps whatever origins land
-//! near the chunk, which is a Poisson-ish count that occasionally spikes. That
-//! difference is invisible in a criterion median.
+//! The spread is expected to be much wider for a carver whose cost depends on
+//! how many features happen to land near a chunk than for one whose cost is a
+//! fixed function of the chunk.
 //!
-//! Both carvers are measured on the same world settings as the shipped `.env`
-//! and the parity test, and on fresh surface-generated chunks with the setup
-//! excluded from the timed region.
+//! # What is compared, and why
+//!
+//! Minecraft's approach (`mc`) against our 2D strategy (`tube`), both running
+//! on the current architecture. `mc` is the 3D mechanism reproduced from
+//! minecraft.wiki; `tube` is the voxel-local 2D carver. Measuring them on the
+//! same band, the same seed and the same fresh chunks is the whole point, so
+//! nothing else is in the table.
+//!
+//! `tube` is measured **twice**: once as the default world (three noise cave
+//! types) and once with the opt-in pillar type enabled, because
+//! `tube::carve` uses `default_configs()` and therefore silently excludes
+//! pillars. Reporting only the first would understate what the 2D carver does.
+//!
+//! The original `density`/`sparse` pair is deliberately NOT here. Those are the
+//! two Pass-2 algorithms from `PROJECT.md` section 1, which is a different
+//! comparison (O(N^3) vs O(S)) and has its own benchmark in `benches/carvers.rs`.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use voxel_core::config::{CarveParity, CaveParams};
 use voxel_core::domain::ChunkPos;
-use voxel_core::terrain::{self, capsule, density, heightmap::HeightMap, mc, sparse, tube};
+use voxel_core::terrain::{self, capsule, heightmap::HeightMap, mc, tube, tube::CaveType};
 use voxel_core::world::Chunk;
 
 /// The shipped `.env` value and the one the parity test asserts on. At 0.02 the
 /// sparse carver does almost no work, so its tail would be flattering fiction.
-const ORIGIN_DENSITY: f32 = 2.0;
 const SEED: u32 = 1337;
 /// Band width used for the coverage note, matching the parity test's own band so
 /// the two reports cannot disagree.
-const PARITY_SIDE: i32 = 8;
 /// Samples per carver. p99.9 of fewer samples is the worst sample, not a
 /// percentile.
 const SAMPLES: usize = 5000;
@@ -65,14 +73,6 @@ const POSITIONS: [(i32, i32); 8] = [
 fn cave_band_y() -> i32 {
     let band = terrain::measured_band_chunks();
     band.start + (band.end - band.start) / 2
-}
-
-fn params() -> CaveParams {
-    CaveParams {
-        origin_density: ORIGIN_DENSITY,
-        min_radius: 1.5,
-        max_radius: 4.0,
-    }
 }
 
 /// Nearest-rank percentile of a sorted slice.
@@ -155,16 +155,6 @@ fn report(latencies: &[Latency], baseline: &str) {
         "per-chunk carve latency, microseconds ({} samples per carver, seed {SEED})",
         SAMPLES
     );
-    println!("cave params: origin_density={ORIGIN_DENSITY} min_radius=1.5 max_radius=4.0");
-    let parity = CarveParity::measure(SEED, &params(), PARITY_SIDE);
-    println!(
-        "  coverage over the {}x2x{} parity band: density {:.1}%, sparse {:.1}% ({:.1}pp apart)",
-        PARITY_SIDE,
-        PARITY_SIDE,
-        parity.density_percent(),
-        parity.sparse_percent(),
-        parity.divergence()
-    );
     println!(
         "setup (surface generation) excluded; chunk positions cycled over {} x/z slots in the cave band",
         POSITIONS.len()
@@ -231,30 +221,32 @@ fn report(latencies: &[Latency], baseline: &str) {
 
 fn main() {
     let seed = SEED;
-    let p = params();
 
     // Every cave carver, not just the two the O(N^3)-vs-O(S) headline needed.
     // `tube` and its per-type rows are what the 2D strategy is judged on, and
     // `mc` is the baseline it is judged against, so all of them need percentiles.
     let all = vec![
-        measure("density", seed, |c| {
-            black_box(density::carve(c, seed));
-        }),
-        measure("sparse", seed, |c| {
-            black_box(sparse::carve(c, seed, &p));
-        }),
         measure("mc", seed, |c| {
             black_box(mc::carve(c, seed));
         }),
         measure("capsule", seed, |c| {
             black_box(capsule::carve(c, seed));
         }),
+        // Our 2D strategy in full: the three noise types PLUS the opt-in
+        // pillar type, so the measurement covers everything the 2D carver can
+        // do rather than only the default world. `tube::carve` would silently
+        // measure three types, because `default_configs()` disables anything
+        // not in `CaveType::ALL` - which is how the pillar work first went
+        // unmeasured.
         measure("tube", seed, |c| {
             black_box(tube::carve(c, seed));
         }),
+        measure("tube+pillar", seed, |c| {
+            black_box(tube::carve_types(c, seed, &CaveType::ALL_TYPES.map(|t| t.cutoffed())));
+        }),
     ];
 
-    report(&all, "density");
+    report(&all, "mc");
 
     // Self-check: a harness that measured nothing would print a plausible table
     // of zeros. Cheap, and it has to hold for the numbers to mean anything.
@@ -266,12 +258,6 @@ fn main() {
             l.name
         );
     }
-    let parity = CarveParity::measure(seed, &p, PARITY_SIDE);
-    assert!(
-        parity.sparse_carved > 0 && parity.density_carved > 0,
-        "a carver carved nothing: {}",
-        parity.summary()
-    );
     // The band must actually contain caves, or every timing above times work
     // the carvers skipped. The absence of this check is what let a hardcoded
     // `y = 1` measure empty chunks unnoticed.

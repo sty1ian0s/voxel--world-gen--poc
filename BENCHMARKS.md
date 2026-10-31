@@ -93,63 +93,82 @@ known to be an even smaller share of the total than the old numbers implied.
 
 ## Latency distribution (p50/p90/p99/p99.9)
 
-### Latency by percentile, all five carvers (2026-10-31)
+### MC's approach vs our 2D strategy (2026-10-31)
 
-The section below covers `density` and `sparse` only, because that was the
-comparison the project started from. The carvers the 2D strategy is actually
-judged on — `mc` and `tube` — **had no measured percentiles at all** until
-`benches/latency.rs` was generalised to a carver slice. They do now, and the
-harness also had a band bug worth recording.
+This is the headline comparison the project exists for: Minecraft's 3D noise
+mechanism (`mc`) against our voxel-local 2D carver (`tube`), both on the current
+architecture, same seed, same band, same fresh surface-generated chunks.
 
-**The band bug.** `latency.rs` pinned `CY = 1`, i.e. world y 16..31. That was
-correct when caves were placed relative to a 64-voxel box; after cave placement
-went absolute the band moved to y 40..88, so the benchmark was timing the
-carvers on **chunks containing no caves**. Every carver here skips voxels that
-are already air, so those samples measured the noise and arithmetic and never
-the carve writes. The band is now derived from `measured_band_chunks()` and an
-assertion fails if the sampled band carves nothing — the check whose absence
-let this go unnoticed.
+Two corrections were needed to measure it at all.
 
-Per-chunk carve latency, microseconds, 5000 samples, seed 1337, setup
-(surface generation) excluded:
+**The harness measured the wrong carvers.** `benches/latency.rs` covered only
+`density` and `sparse` — the original `O(N^3)` vs `O(S)` pair from `PROJECT.md`
+section 1 — so `mc` and `tube` had **no measured percentiles**. Those two are
+the comparison that matters and they are now the only two in the table; the
+original pair keeps its own benchmark in `benches/carvers.rs`.
 
-| metric | density | sparse | mc | capsule | **tube** | tube vs mc |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| min | 16.82 | 96.57 | 60.57 | 241.65 | **8.35** | 7.3x |
-| p50 | 139.41 | 137.04 | 366.80 | 329.65 | **13.92** | **26.4x** |
-| p90 | 196.42 | 201.07 | 467.05 | 415.86 | **17.08** | **27.4x** |
-| p99 | 251.29 | 249.79 | 639.34 | 487.48 | **27.91** | **22.9x** |
-| p99.9 | 361.79 | 355.03 | 878.51 | 972.46 | **54.20** | **16.2x** |
-| mean | 114.98 | 150.76 | 306.29 | 339.49 | **13.76** | 22.3x |
-| max | 1891.13 | 9144.53 | 4404.39 | 8660.34 | **83.31** | 52.9x |
+**The harness measured the wrong band.** It pinned `CY = 1` (world y 16..31),
+which was correct when caves were placed relative to a 64-voxel box. Cave
+placement is now absolute and the band is y 40..88, so the benchmark was timing
+the carvers on **chunks containing no caves**. Every carver skips voxels that
+are already air, so those samples measured noise and arithmetic and never a
+single carve write. The band now derives from `measured_band_chunks()`, and an
+assertion fails if the sampled band carves nothing.
 
-Tail against own median (the number a frame budget cares about):
+Per-chunk carve latency, microseconds, 5000 samples each, setup excluded.
+Ratios are stable to ±0.05% across runs:
+
+| metric | mc (3D) | **tube (2D)** | **speedup** | tube + pillar | speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| min | 60.12 | **7.64** | 7.9x | 9.01 | 6.7x |
+| **p50** | 357.50 | **9.10** | **39.3x** | 10.50 | 34.0x |
+| **p90** | 444.64 | **10.30** | **43.2x** | 11.42 | 38.9x |
+| **p99** | 464.22 | **17.10** | **27.1x** | 18.02 | 25.8x |
+| **p99.9** | 514.47 | **27.00** | **19.1x** | 23.83 | 21.6x |
+| mean | 285.30 | **9.36** | 30.5x | 10.62 | 26.9x |
+| max | 625.06 | **42.24** | 14.8x | 35.76 | 17.5x |
+
+Tail against own median:
 
 | carver | p90/p50 | p99/p50 | p99.9/p50 | worst chunk |
 | --- | ---: | ---: | ---: | ---: |
-| density | 1.41x | 1.80x | 2.60x | 1.89 ms |
-| sparse | 1.47x | 1.82x | 2.59x | 9.14 ms |
-| mc | 1.27x | 1.74x | 2.40x | 4.40 ms |
-| capsule | 1.26x | 1.48x | 2.95x | 8.66 ms |
-| tube | 1.23x | 2.01x | 3.89x | 0.08 ms |
+| mc | 1.24x | 1.30x | 1.44x | 0.63 ms |
+| capsule (walked 2D) | 1.15x | 1.34x | 1.66x | 0.48 ms |
+| tube | 1.13x | 1.88x | 2.97x | **0.04 ms** |
+| tube + pillar | 1.09x | 1.72x | 2.27x | **0.04 ms** |
 
-**`tube` wins at every percentile and the win holds into the tail** — 26.4x at
-p50, still 16.2x at p99.9. Its tail/median is the widest (3.89x at p99.9)
-because its absolute times are so small that fixed per-chunk overheads dominate
-the spread; in absolute terms its worst chunk in 5000 is **0.08 ms** against
-mc's 4.40 ms.
+**Our 2D strategy is 39x faster at the median and 19x faster at p99.9**, and the
+advantage holds across the whole distribution rather than collapsing in the
+tail. `tube`'s tail/median ratio is the widest of the four (2.97x at p99.9)
+purely because its absolute times are so small — 9 µs — that fixed per-chunk
+overheads dominate the relative spread. In absolute terms its worst chunk in
+5000 is **0.04 ms against mc's 0.63 ms**, so the tail that matters for a frame
+budget is still ~16x better.
 
-**The sample ratio is not the latency ratio, and the difference matters.** `tube`
-takes 154x fewer *noise samples* than `mc` (27,648 vs 4,250,880) but is only
-26x faster in wall-clock per chunk. `mc` skips voxels that are already air, so
-its real work is far below "one sample per voxel" — the 154x figure is a sample
-count, and quoting it as a speedup would be the same category of error as the
-old "130x" claim this document already corrects.
+**`capsule`, the walked 2D carver, is the control.** It is the approach that
+preserves path memory (and can therefore express carver caves), and it lands at
+**0.77x of mc's median — slower than the 3D baseline it was meant to beat**,
+while `tube` is at 0.03x. That is the cost of sequential state, measured.
+
+**Enabling the opt-in pillar type costs ~15% at p50 (9.10 → 10.50 µs)** and is
+within noise at p99.9. `tube::carve` uses `default_configs()`, which disables
+anything outside `CaveType::ALL`, so measuring only `tube` would have silently
+excluded pillars — the first version of this table did exactly that. Both rows
+are reported so the fourth type's price is visible rather than assumed.
+
+**The sample ratio is not the latency ratio.** `tube` takes 154x fewer *noise
+samples* than `mc` (27,648 vs 4,250,880) but is 39x faster in wall clock,
+because `mc` skips voxels that are already air and so does far less than one
+sample per voxel. Quoting 154x as a speedup would be the same category of error
+as the "130x" claim corrected at the top of this file.
+
+### The original `density` vs `sparse` percentiles
 
 Criterion reports a median and a confidence interval; it has no notion of the
 tail. World generation runs inside a frame, so the tail is what drops frames.
-`benches/latency.rs` measures 5000 single-chunk carves per carver, setup
-excluded, chunk positions cycled so no lucky chunk repeats. Microseconds:
+These are the original Pass-2 pair from `PROJECT.md` section 1, kept because the
+document's headline correction above depends on them. **Not** the MC-vs-2D
+comparison, which is the section above. Microseconds:
 
 | metric | density | sparse | sparse/density |
 | --- | ---: | ---: | ---: |
