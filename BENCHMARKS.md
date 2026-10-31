@@ -264,6 +264,107 @@ or entirely full, not to abandon greedy meshing.
 3.28 µs). The column scan plus flood fill is cheap enough that cave complexity
 barely registers at this scale, which is why the two are within a microsecond.
 
+## Streaming: peak RSS is bounded by the window, not the region
+
+`worldstat`, same binary, seed 1337, `--rows 16`, `/usr/bin/time -v`:
+
+| region | chunks | voxels | peak RSS | wall |
+| --- | ---: | ---: | ---: | ---: |
+| 64x64 | 32,768 | 134 M | 4,816 kB | 0:44 |
+| 256x256 | 524,288 | 2,147 M | 11,184 kB | 9:47 |
+
+**16x the area for 2.3x the memory.** It is not flat, and the reason is
+structural rather than noise: the sliding window carries one chunk row *per
+voxel* across each boundary, so memory is `O(side)`, not `O(side²)`. Compare a
+full in-RAM mask of the same region, which would exceed 1 GB.
+
+This is the property the streaming rewrite exists for. An earlier version sized
+the window per voxel instead of per chunk — multiplying the region width by 16
+twice — and at 256x256 allocated a single 1.77 GB buffer, so peak RSS tracked
+area exactly like the in-RAM path it was meant to replace. Measured before the
+fix: 395,568 kB at 64 against 1,574,332 kB at 256.
+
+## Cave measurement at scale
+
+`worldstat` streams a region the in-RAM path cannot hold and reports shape
+statistics per carver. Two things about its numbers must be read carefully, and
+both are stated inline in its own output:
+
+- **`chunk_connected_share` is chunk-granular and over-merges.** Components are
+  linked between cave *chunks*, not cave voxels, because a chunk is the unit the
+  window stores. Any two cave chunks that share a chunk merge, so this reads near
+  100% where `cavestat`'s voxel-accurate figure is far lower.
+- **It is NOT comparable with `cavestat`'s connectivity.** Same word, different
+  question: `cavestat` judges MC-likeness on an 8x8x8 world; `worldstat`
+  surveys shape at a scale no in-RAM measurement reaches.
+
+Per-statistic scope (global vs windowed) is tabulated in the module docs of
+`voxel_core::debug::window`. Summed counts and histogram quantiles are global and
+exact at any window size; component count, largest component and trunk length are
+windowed, and the docs state which direction each bound errs in.
+
+### Per-carver coverage
+
+Measured on the committed tree after absolute-Y cave placement landed. `cavestat`,
+8x8x8 chunks, seed 1337, `origin_density` 2.
+
+| carver | void% | connectivity | components | max_col | samples | cave-shaped |
+| --- | ---: | ---: | ---: | ---: | ---: | :---: |
+| `mc` (1.18 baseline) | 23.8% | 85.7% | 18,213 | 42 | 4,250,880 | no |
+| `capsule` | 6.4% | 57.6% | 13 | 14 | 2,826,648 | yes |
+| **`tube`** | **6.2%** | **99.2%** | **16** | **17** | **27,648** | **yes** |
+| `density` | 16.3% | 38.5% | 146 | 99 | — | — |
+| `sparse` | 22.4% | 3.2% | 948 | 51 | — | — |
+
+`tube`'s three MC cave types measured alone:
+
+| type | void% | connectivity | components | mean_col | max_col | samples |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cheese | 3.3% | 67.6% | 5 | 8.43 | 16 | 9,216 |
+| spaghetti | 2.7% | 91.2% | 3 | 4.41 | 8 | 9,216 |
+| noodle | 0.9% | 95.2% | 13 | 2.23 | **4** | 9,216 |
+
+Widths order cheese > spaghetti > noodle as the wiki's mechanisms predict, and
+noodle's 4-voxel column depth sits inside the wiki's 1–5 block band. Every type
+passes `looks_like_tunnels`; the MC baseline does not (`max_col` 42 — its cheese
+component makes genuinely tall voids, which is MC-accurate but not tunnel-shaped).
+
+**Reading the coverage column.** The coverage figures are *not* comparable with
+the historical 19–20% parity band, and the reason is measurement scope, not
+carver behaviour. When cave placement became absolute, `carve_fraction*` moved
+onto `measured_band_chunks()` (chunks 2..6, world y 32..95) instead of the old
+chunks 1..3 (y 16..47), because the old window no longer contained the caves at
+all. The taller window roughly doubles the solid rock counted while the carve
+stays the same, so the ratio falls and the carved volume does not. Compare
+carvers on the same band or not at all.
+
+`mc`'s void% *rose* to 23.8% for the same reason inverted: its band widened from
+23.7..46.7 to the real surface band 40..88, so it now carves where the terrain
+actually is.
+
+### What the 2D carver cannot do
+
+Two of Minecraft's five cave mechanisms are out of reach for a voxel-local
+carver, verified by measurement rather than assumed:
+
+- **Noise pillars.** A pillar is stone at a column whose lateral neighbours are
+  air, so it needs neighbour dependence — exactly what makes this design `O(1)`.
+  Measured: 26 of 318,422 stone voxels (0.0082%) have air on all four lateral
+  sides, mean vertical run 2.23 voxels. That is speckle, not pillars, and it is
+  documented as out of reach rather than faked.
+- **Carver caves** (main room plus 1–4 trunks and branches, 85–112 blocks long,
+  branching freely in 3D). A per-column interval cannot represent a path that
+  revisits an `(x, z)` column at two different heights. Multiple intervals per
+  column — which this carver does implement — recovers *some* of that freedom
+  (a column can carry a cheese chamber and a noodle tunnel at once) but not
+  branching topology.
+
+One measured design constraint worth knowing before retuning: connectivity
+follows the `xz` footprint overlap, not column height. Raising the noodle radius
+2 → 4 → 6 moved connectivity 40.4 → 40.3 → 40.1% while void doubled. The `y`
+axis cannot rescue a sparse `xz` set, so `epsilon` is the coverage knob and
+radius is the tunnel-height knob.
+
 ## Caveats
 
 - Single machine (WSL2, 16 threads), single run unless stated. Absolute times

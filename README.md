@@ -27,6 +27,9 @@ See [`PROJECT.md`](PROJECT.md) for the original architecture and
 | Debug HUD (fps, frame-time percentiles, live carver switch) | done, verified via software raster |
 | wgpu + winit app | **compiles; not executed — see below** |
 | Criterion benchmarks | done, results committed |
+| Streaming generation (unbounded x/z, absolute-Y band) | done, byte-identical to the batch path |
+| Sliding-window cave metrics (`worldstat`) | done, RSS bounded by window not area |
+| All five carvers behind `Carver`, `.env` + runtime switch | done |
 
 ### Known limitation: the render path was never run
 
@@ -56,7 +59,7 @@ window edge.
 | `W` `A` `S` `D` | Move |
 | Arrows | Look (yaw / pitch) |
 | `Space` / `Shift` | Rise / descend |
-| `C` | **Switch carver** (`density` ↔ `sparse`) and regenerate in place |
+| `C` | **Switch carver**: cycle all five (`density` → `sparse` → `mc` → `capsule` → `tube`) and regenerate in place |
 | `M` | **Mesh view**: draw greedy quad outlines over the terrain |
 | `B` | **Benchmark readout**: generation timings and carve coverage |
 | `H` | Toggle the HUD |
@@ -152,7 +155,7 @@ in `.env.local` (gitignored).
 | `APP_ENV` | `dev` (default) or `prod` |
 | `VOXEL_WORLD_X/Y/Z` | World size in chunks |
 | `VOXEL_WORLD_SEED` | Generation seed |
-| `VOXEL_CARVER` | `density` (Pass 2A) or `sparse` (Pass 2B) |
+| `VOXEL_CARVER` | `density` (default) \| `sparse` \| `mc` \| `capsule` \| `tube` |
 | `VOXEL_CAVE_ORIGIN_DENSITY` | Cave origins per 1000 voxels³ |
 | `VOXEL_CAVE_MIN/MAX_RADIUS` | Stamp radius range |
 | `VOXEL_VALIDATION` | Extra debug assertions |
@@ -179,6 +182,74 @@ cargo run -p voxel-app --bin debug -- --slice 40 --images --out-debug debug-out
 
 A correct cross-section reads as sky on top, grass (`"`), dirt (`:`), then
 stone (`#`) below.
+
+## Streaming: one world, many windows
+
+Generation is a pure function of `(seed, x, z)`, so a world is not a box that
+gets filled — it is an infinite field that gets **sampled**. Two consequences the
+code is built around:
+
+- **One generator, one chunk at a time.** `voxel_core::world::WorldGen` turns a
+  `ChunkPos` into a finished chunk reusing a single 12 KiB buffer. Nothing
+  world-sized is allocated, which is what lets `worldstat` measure a 256x256
+  region (2.1 G voxels) in 11 MB.
+- **A world height is a clipping window, not a parameter.** The surface band is
+  absolute (`heightmap::BASE_Y` 64 ± 24, sea level 62), so the same seed at 64
+  voxels and at 512 generates *the same terrain*; the shorter window simply
+  materialises less of it. Overlapping windows agree byte-for-byte, which
+  `tests/absolute_world.rs` asserts.
+
+The app's `StreamWorld` is a **residency cache** over that generator — a
+`HashMap` of loaded chunks plus an eviction radius and generation counters — not
+a second implementation. That matters because `tests/stream_parity.rs` asserts a
+streamed chunk is byte-identical to the same chunk from the in-RAM batch path
+(packed `u16`: block id, sunlight, block light, all 4096 voxels). With the fold,
+that guarantee covers the chunks the app actually renders.
+
+## Measuring caves: two instruments, two questions
+
+| tool | question | scope |
+| --- | --- | --- |
+| `cavestat` | "do these caves *look* like Minecraft's?" | 8x8x8 chunks, in RAM, **voxel-accurate** |
+| `worldstat` | "what shape are these caves at scale, per carver?" | streamed, unbounded region, **mixed scope** |
+
+`cavestat` builds a full mask and flood fills it, so its connectivity is exact:
+the share of cave *air* in the single largest connected component. That is the
+number to quote for MC-likeness.
+
+`worldstat` cannot afford that mask at 256x256, so it links components between
+cave **chunks** rather than cave voxels, carrying one chunk row across its
+sliding window. Two cave voxels in the same chunk therefore merge even if they
+never touch, and `chunk_connected_share` reads far higher as a result.
+
+> **These two connectivity numbers are NOT comparable.** `worldstat`'s is
+> chunk-granular and over-merges; `cavestat`'s is voxel-accurate. `worldstat`
+> prints the caveat inline next to the number. Use `cavestat` to judge a carver,
+> `worldstat` to survey one at a scale no in-RAM measurement can reach.
+
+Every `worldstat` statistic is labelled **global** (summed counts and histogram
+quantiles — exact at any window size) or **windowed** (component count, largest
+component, trunk length). `voxel_core::debug::window`'s module docs carry the
+full table and state which direction each bound errs in.
+
+```sh
+cargo run --release -p voxel-app --bin worldstat -- --side 256 --rows 16
+cargo run --release -p voxel-app --bin cavestat
+```
+
+### Streaming is bounded by window size, not region area
+
+Peak RSS for the same binary, same seed, `--rows 16`:
+
+| region | chunks | voxels | peak RSS | wall |
+| --- | ---: | ---: | ---: | ---: |
+| 64x64 | 32,768 | 134 M | 4.8 MB | 44 s |
+| 256x256 | 524,288 | 2,147 M | 11.2 MB | 9 m 47 s |
+
+16x the area for 2.3x the memory. The residual is `O(side)` by construction — the
+per-voxel carried chunk row that carries connectivity across the sliding window —
+not `O(area)`. Compare a full in-RAM mask of the 256x256 region, which would be
+over 1 GB.
 
 ## Layout
 
