@@ -393,20 +393,48 @@ pub struct TypeConfig {
     /// into stone. `x.powf(1.0) == x` bitwise, so `1.0` is not merely close to
     /// the old formula, it *is* the old formula.
     ///
-    /// Above `1.0` the taper instead gates *selection*: only columns with
-    /// `(1 - |band|/epsilon)^taper >= 0.5` qualify, and every survivor is given
-    /// the **full** radius. That is what makes a pillar rather than a thin
-    /// slice. Height and footprint are otherwise welded together — `width`
+    /// Above `1.0` the taper instead gates *selection*: only columns whose band
+    /// value is inside [`Self::pillar_band`] qualify, and every survivor is
+    /// given the **full** radius. That is what makes a pillar rather than a
+    /// thin slice. Height and footprint are otherwise welded together — `width`
     /// scales both — so sharpening the height alone just collapses the column
     /// (measured `max_col` 12 -> 8) instead of narrowing it. Decoupling them is
-    /// the whole trick, and it is why the gate sets `width` back to 1.0.
+    /// the whole trick, and it is why the gate resets `width` to 1.0.
     ///
-    /// The effective band is `epsilon * (1 - 0.5^(1/taper))`, so taper and
-    /// epsilon trade off against each other and must be tuned as a pair.
+    /// Taper and epsilon trade off against each other and must be tuned as a
+    /// pair; [`Self::pillar_band`] is the combined effect.
     pub taper: f32,
 }
 
 impl TypeConfig {
+    /// The `|band|` cutoff the taper gate tests, **precomputed**.
+    ///
+    /// The gate is `width.powf(taper) >= 0.5`, i.e.
+    /// `(1 - |band|/epsilon)^taper >= 0.5`. Solving that for `|band|` gives a
+    /// closed form:
+    ///
+    /// ```text
+    ///     |band| <= epsilon * (1 - 0.5^(1/taper))
+    /// ```
+    ///
+    /// so the transcendental collapses to a constant that depends only on the
+    /// configuration, never on the voxel. Hoisting it out of `interval_for` —
+    /// which runs once per column — is worth doing: `powf` measured 5.83
+    /// ns/element against 0.58 ns for the resulting comparison, a 10x
+    /// difference in the carver's innermost loop.
+    ///
+    /// Returns `epsilon` unchanged when `taper <= 1.0`, so a caller can test
+    /// `band.abs() <= cfg.pillar_band()` unconditionally and get the plain
+    /// ungated band rule with no branch and no special case. The three noise
+    /// cave types take exactly that path.
+    pub fn pillar_band(&self) -> f32 {
+        if self.taper > 1.0 {
+            self.epsilon * (1.0 - 0.5f32.powf(1.0 / self.taper))
+        } else {
+            self.epsilon
+        }
+    }
+
     /// This type's tuned configuration, as a value the tests can perturb.
     pub const fn tuned(self) -> Self {
         self.cave_type.cutoffed()
@@ -605,7 +633,7 @@ fn corner_point(nx: i32, nz: i32) -> (f32, f32) {
 /// neighbouring columns of the same type sit at different heights and their
 /// intervals union into a sloping tube.
 #[inline]
-pub(crate) fn interval_for(corner: Corner, config: &TypeConfig) -> Interval {
+pub(crate) fn interval_for(corner: Corner, config: &TypeConfig, pillar_band: f32) -> Interval {
     // A disabled type carves nothing. Stated explicitly rather than left to the
     // width guard below, which happens to reach the same answer by dividing by
     // zero — this is the predicate `Lattice::sample` reads to skip the
@@ -619,19 +647,16 @@ pub(crate) fn interval_for(corner: Corner, config: &TypeConfig) -> Interval {
     if width <= 0.0 {
         return Interval::EMPTY;
     }
-    // The pillar gate. Above taper 1.0 only columns inside a sharpened core
-    // qualify, and each survivor then gets the FULL radius rather than a
-    // tapered slice — the two changes together are what turn a band into a
-    // standing column. Gating without the reset would just narrow the slice,
-    // and resetting without the gate would thicken every column in the band.
+    // The pillar gate, as a single comparison against a precomputed cutoff.
     //
-    // The guard is `> 1.0` rather than `>= 1.0` on purpose: the three noise
-    // cave types carry taper 1.0 and must take the original arithmetic below
-    // untouched, which keeps their measured shape pinned. `x.powf(1.0) == x`
-    // bitwise, so even the branch-free version would agree — the guard is there
-    // to make that a structural fact rather than an arithmetic coincidence.
+    // `width.powf(taper) >= 0.5` was solved for `|band|` at configuration time
+    // (see `TypeConfig::pillar_band`), which removes a transcendental from the
+    // per-column path: `powf` measured 5.83 ns/element against 0.58 ns here.
+    // For the three noise cave types `taper` is 1.0, `pillar_band()` is
+    // `epsilon`, and this block is skipped entirely — so their arithmetic below
+    // is byte-for-byte what it always was.
     if config.taper > 1.0 {
-        if width.powf(config.taper) < 0.5 {
+        if corner.band.abs() > pillar_band {
             return Interval::EMPTY;
         }
         width = 1.0;
@@ -668,6 +693,9 @@ pub fn carve_types(
     // others, and takes none at all for a disabled type. Counting the disabled
     // ones would report work that was not done and make the per-type cost
     // numbers indistinguishable from the combined one.
+    // Precomputed once per chunk per type: `interval_for` runs per column, and
+    // `pillar_band()` would otherwise re-derive a `powf` on every one of them.
+    let bands = types.map(|t| t.pillar_band());
     let enabled = types.iter().filter(|t| t.epsilon > 0.0).count();
     let samples = 2 * 9 * enabled as u64;
     let (ox, oy, oz) = chunk.pos().origin();
@@ -683,7 +711,7 @@ pub fn carve_types(
             // Sized from `lattices` rather than written as a literal list, so
             // adding a type to `CaveType::ALL` cannot silently leave it out.
             let intervals: [Interval; CaveType::COUNT] =
-                std::array::from_fn(|i| interval_for(lattices[i].at(wx, wz), &types[i]));
+                std::array::from_fn(|i| interval_for(lattices[i].at(wx, wz), &types[i], bands[i]));
 
             let mut lo = i32::MAX;
             let mut hi = i32::MIN;
@@ -733,10 +761,12 @@ pub fn cave_type_at(
     let pos = ChunkPos::from_world(wx, wy, wz);
     let lattices = types.map(|config| Lattice::sample(pos, seed, &config));
     let y = wy as f32 + 0.5;
-    lattices
-        .iter()
-        .zip(types)
-        .any(|(l, config)| interval_for(l.at(wx as f32 + 0.5, wz as f32 + 0.5), config).contains(y))
+    // One voxel is being answered, not a chunk swept, so deriving each type's
+    // band once per call is already the hoisted form.
+    let bands = types.map(|t| t.pillar_band());
+    lattices.iter().zip(types).zip(bands).any(|((l, config), band)| {
+        interval_for(l.at(wx as f32 + 0.5, wz as f32 + 0.5), config, band).contains(y)
+    })
 }
 
 /// Percentage of the solid rock this carver removes over a chunk band.
@@ -1193,6 +1223,7 @@ mod tests {
     fn a_column_can_carry_intervals_of_more_than_one_type() {
         let types = CaveType::default_configs();
         let lattices = types.map(|c| Lattice::sample(ChunkPos::ORIGIN, SEED, &c));
+        let bands = types.map(|t| t.pillar_band());
         let mut both = 0;
         let mut checked = 0;
         for z in 0..16 {
@@ -1202,7 +1233,8 @@ mod tests {
                 let active = lattices
                     .iter()
                     .zip(&types)
-                    .filter(|(l, c)| interval_for(l.at(wx, wz), c).half_height > 0.0)
+                    .zip(&bands)
+                    .filter(|((l, c), b)| interval_for(l.at(wx, wz), c, **b).half_height > 0.0)
                     .count();
                 if active >= 2 {
                     both += 1;
