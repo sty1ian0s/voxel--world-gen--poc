@@ -129,6 +129,48 @@ runs of an identical binary, medians moved ~30% and p99.9 moved by up to 3x.
 Within-run percentile *shape* is trustworthy; the exact tail figure is not, and
 neither is the max column. Treat the ratios as the result.
 
+### Rerun after the pillar work (2026-10-31)
+
+The per-column `powf` in the pillar gate was replaced with a precomputed
+threshold (`6a34e48`), so the tables above were re-measured. **Nothing in the
+recorded numbers moved for reasons attributable to that change**, and the rerun
+is recorded here because it is a useful demonstration of the caveat above
+rather than because it shows an effect.
+
+Both untouched carvers came out slower than recorded, by a similar factor:
+
+| metric | density recorded | density rerun | sparse recorded | sparse rerun |
+| --- | ---: | ---: | ---: | ---: |
+| min | 276.85 | 287.53 (1.04x) | 92.70 | 97.55 (1.05x) |
+| p50 | 302.56 | 379.28 (1.25x) | 103.13 | 152.46 (1.48x) |
+| p90 | 316.02 | 429.09 (1.36x) | 116.93 | 193.22 (1.65x) |
+| p99 | 348.23 | 523.75 (1.50x) | 126.82 | 227.03 (1.79x) |
+| p99.9 | 442.50 | 783.78 (1.77x) | 149.39 | 354.81 (2.38x) |
+
+`density` and `sparse` are **not reached by the pillar change at all** -
+`benches/latency.rs` imports only those two carvers - so a 1.25-1.5x shift in
+both is machine state, exactly the scheduling sensitivity the caveat describes.
+The ratio, which the caveat says to trust, is stable:
+
+| | recorded | rerun |
+| --- | ---: | ---: |
+| sparse/density p50 | 0.34x | 0.40x |
+
+For the carvers the change *does* touch, the shape and coverage numbers are
+byte-identical to the tables below (`tube` 6.2% / 99.2% / 16 components;
+`pillar` 0.5% / mean_col 14.00 / 9,216 samples), which is the result that
+matters: the closed form is behaviour-preserving.
+
+The local win was measured directly instead, since `cavestat` cannot resolve it.
+On 20M values straddling the threshold, `powf` costs 5.83 ns/element against
+0.58 ns for the comparison - **10x** - and an interleaved A/B of the two
+revisions (7 alternating pairs, separate worktrees so nothing else varies) puts
+the end-to-end `cavestat` delta at **-1.5% for pillar and +2.1% for tube with
+sample SD of 9-18 ms**. The end-to-end effect is therefore *not* resolvable at
+this scale, and `gen_ms` in the tables below should not be read as evidence for
+or against the change.
+
+
 ## Resource usage
 
 `carver_bench 8` (512 chunks, sequential phases in one process):
