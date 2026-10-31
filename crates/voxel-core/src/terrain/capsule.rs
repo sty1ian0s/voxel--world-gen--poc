@@ -91,23 +91,50 @@ pub struct Vec3(pub f32, pub f32, pub f32);
 ///
 /// Squared throughout: the sdF here only ever feeds a sign test, so a square
 /// root would be paid once per voxel tested to produce a value nobody reads.
-#[inline]
-fn inside_capsule(point: Vec3, a: Vec3, b: Vec3, radius: f32) -> bool {
-    let Vec3(px, py, pz) = point;
-    let Vec3(ax, ay, az) = a;
-    let Vec3(bx, by, bz) = b;
-    // Distance from the point to the segment ab, all in squared space except
-    // the final comparison.
-    let (abx, aby, abz) = (bx - ax, by - ay, bz - az);
-    let (apx, apy, apz) = (px - ax, py - ay, pz - az);
-    let ab_len_sq = abx * abx + aby * aby + abz * abz;
-    let t = if ab_len_sq <= f32::EPSILON {
-        0.0
-    } else {
-        ((apx * abx + apy * aby + apz * abz) / ab_len_sq).clamp(0.0, 1.0)
-    };
-    let (dx, dy, dz) = (apx - abx * t, apy - aby * t, apz - abz * t);
-    dx * dx + dy * dy + dz * dz <= radius * radius
+#[derive(Debug, Clone, Copy)]
+struct Capsule {
+    a: Vec3,
+    /// `b - a`, and its squared length. Both are fixed for the capsule while
+    /// thousands of voxels are tested against it, so computing them per voxel
+    /// was pure waste in the hottest loop in the carver.
+    ab: Vec3,
+    ab_len_sq: f32,
+    /// `radius * radius`, for the same reason.
+    radius_sq: f32,
+}
+
+impl Capsule {
+    #[inline]
+    fn new(a: Vec3, b: Vec3, radius: f32) -> Self {
+        let ab = Vec3(b.0 - a.0, b.1 - a.1, b.2 - a.2);
+        Self {
+            a,
+            ab,
+            ab_len_sq: ab.0 * ab.0 + ab.1 * ab.1 + ab.2 * ab.2,
+            radius_sq: radius * radius,
+        }
+    }
+
+    /// Squared distance from `point` to the segment, without a square root:
+    /// the value only ever feeds a comparison against the radius.
+    #[inline]
+    fn contains(&self, point: Vec3) -> bool {
+        let Vec3(px, py, pz) = point;
+        let Vec3(ax, ay, az) = self.a;
+        let (apx, apy, apz) = (px - ax, py - ay, pz - az);
+        let t = if self.ab_len_sq <= f32::EPSILON {
+            0.0
+        } else {
+            ((apx * self.ab.0 + apy * self.ab.1 + apz * self.ab.2) / self.ab_len_sq)
+                .clamp(0.0, 1.0)
+        };
+        let (dx, dy, dz) = (
+            apx - self.ab.0 * t,
+            apy - self.ab.1 * t,
+            apz - self.ab.2 * t,
+        );
+        dx * dx + dy * dy + dz * dz <= self.radius_sq
+    }
 }
 
 /// SplitMix64, so a tunnel's seed comes from its own coordinates.
@@ -210,8 +237,8 @@ impl Fields {
         }
     }
 
-    /// Samples all three fields at one column. This is the carver's entire
-    /// noise budget: three 2D samples, never a 3D one.
+    /// Samples all three fields at one column, for the seed point where all
+    /// three are genuinely needed.
     #[inline]
     fn at(&self, x: f32, z: f32) -> (f32, f32, f32) {
         (
@@ -219,6 +246,22 @@ impl Fields {
             self.height.get_noise_2d(x, z),
             self.direction.get_noise_2d(x, z),
         )
+    }
+
+    /// The heading field at one column.
+    ///
+    /// Single-field accessors exist because the walk needs one field per step:
+    /// sampling all three to read one cost three times what the step required,
+    /// and the walk is the carver's dominant cost.
+    #[inline]
+    fn direction_at(&self, x: f32, z: f32) -> f32 {
+        self.direction.get_noise_2d(x, z)
+    }
+
+    /// The depth field at one column.
+    #[inline]
+    fn height_at(&self, x: f32, z: f32) -> f32 {
+        self.height.get_noise_2d(x, z)
     }
 }
 
@@ -262,21 +305,18 @@ fn stamp_tunnel(
     }
 
     let radius = base_radius * (0.75 + 0.5 * placement.abs());
-    // The entry heading is the direction field at the seed, so the tunnel
-    // leaves in a direction the field chose rather than one chosen for it.
-    let mut heading = direction * std::f32::consts::PI;
+    // The seed sample of the direction field is deliberately not used as an
+    // entry heading: the first step re-reads the field at the start point
+    // anyway, so reading it twice would be a sample per tunnel for nothing.
+    let _ = direction;
     let mut prev = Vec3(start_x, centre_depth(height), start_z);
-    let _ = heading;
 
     let steps = TUNNEL_LENGTH / STEP;
     for step in 1..=steps {
-        // The heading is advanced from a 2D sample of the *current* position,
-        // so the walk curves according to the field it is travelling through.
-        // Interpolating the two stored samples is what removes the need for a
-        // third axis: the heading is a property of the plane, not of the depth.
-        let (hx, hz) = (prev.0, prev.2);
-        let (_, _, dir_here) = fields.at(hx, hz);
-        heading = dir_here * std::f32::consts::PI;
+        // Two single-field samples per step, not six: the direction field is
+        // read here and the depth field below, and neither step needs the
+        // placement field at all.
+        let heading = fields.direction_at(prev.0, prev.2) * std::f32::consts::PI;
 
         let next_x = prev.0 + heading.cos() * STEP as f32;
         let next_z = prev.2 + heading.sin() * STEP as f32;
@@ -284,8 +324,7 @@ fn stamp_tunnel(
         // Depth follows the 2D height field along the walk, blended with the
         // tunnel's own entry depth so a tunnel drifts rather than snapping to
         // whatever the field says at each step.
-        let (_, h_next, _) = fields.at(next_x, next_z);
-        let target_y = centre_depth(h_next);
+        let target_y = centre_depth(fields.height_at(next_x, next_z));
         let next_y = prev.1 + (target_y - prev.1) * DEPTH_BLEND;
 
         // Taper: thin at both ends, thickest in the middle, which is what MC's
@@ -330,30 +369,35 @@ fn stamp_capsule(
         return false;
     }
 
+    // The capsule's own constants are built once here rather than per voxel.
+    let capsule = Capsule::new(a, b, radius);
+
+    // Walk the local box with flat indices instead of recomputing a world
+    // coordinate and a `VoxelIndex` per voxel: the stride between neighbouring
+    // x is one, and between z is a bit-shift, so the index is carried rather
+    // than rebuilt. `y` moves in steps of 256 because it is the high byte.
+    let mut index = VoxelIndex::from_parts(
+        (min_x - ox) as u8,
+        (min_y - oy) as u8,
+        (min_z - oz) as u8,
+    );
     for wy in min_y..max_y {
+        let mut z_index = index;
         for wz in min_z..max_z {
+            let mut v_index = z_index;
             for wx in min_x..max_x {
-                let (lx, ly, lz) = (
-                    (wx - ox) as u8,
-                    (wy - oy) as u8,
-                    (wz - oz) as u8,
-                );
-                let index = VoxelIndex::from_parts(lx, ly, lz);
                 // Never re-carve air: keeps the operation idempotent and avoids
                 // writing the same voxel once per overlapping capsule.
-                if chunk.block(index).is_air() {
-                    continue;
+                if !chunk.block(v_index).is_air()
+                    && capsule.contains(Vec3(wx as f32 + 0.5, wy as f32 + 0.5, wz as f32 + 0.5))
+                {
+                    chunk.carve(v_index);
                 }
-                if inside_capsule(
-                    Vec3(wx as f32 + 0.5, wy as f32 + 0.5, wz as f32 + 0.5),
-                    a,
-                    b,
-                    radius,
-                ) {
-                    chunk.carve(index);
-                }
+                v_index = v_index.checked_offset(1, 0, 0).unwrap_or(v_index);
             }
+            z_index = z_index.checked_offset(0, 0, 1).unwrap_or(z_index);
         }
+        index = index.checked_offset(0, 1, 0).unwrap_or(index);
     }
     true
 }
