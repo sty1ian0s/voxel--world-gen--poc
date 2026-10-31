@@ -358,13 +358,22 @@ Measured on the committed tree after absolute-Y cave placement landed. `cavestat
 | `density` | 16.3% | 38.5% | 146 | 99 | — | — |
 | `sparse` | 22.4% | 3.2% | 948 | 51 | — | — |
 
-`tube`'s three MC cave types measured alone:
+`tube`'s cave types measured alone (the three noise types plus the opt-in
+pillar):
 
 | type | void% | connectivity | components | mean_col | max_col | samples |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | cheese | 3.3% | 67.6% | 5 | 8.43 | 16 | 9,216 |
 | spaghetti | 2.7% | 91.2% | 3 | 4.41 | 8 | 9,216 |
 | noodle | 0.9% | 95.2% | 13 | 2.23 | **4** | 9,216 |
+| pillar | 0.5% | 14.4% | 138 | **14.00** | 14 | 9,216 |
+
+Pillar is **opt-in** and not part of the default world: a full-height column is
+not a tunnel, so including it in the default union moved the combined carver's
+`max_col` 17 → 26 and flipped its verdict from `tunnels=true` to `tunnels=false`.
+`CaveType::ALL` is the three noise types; `ALL_TYPES` is the complete set. Its
+`tunnels=false` in the table above is correct for a column, and its `mean_col`
+of 14.00 against noodle's 2.23 is the shape the type exists to produce.
 
 Widths order cheese > spaghetti > noodle as the wiki's mechanisms predict, and
 noodle's 4-voxel column depth sits inside the wiki's 1–5 block band. Every type
@@ -386,20 +395,32 @@ actually is.
 
 ### What the 2D carver cannot do
 
-Two of Minecraft's five cave mechanisms are out of reach for a voxel-local
-carver, verified by measurement rather than assumed:
+**Carver caves** (main room plus 1–4 trunks and branches, 85–112 blocks long,
+branching freely in 3D) are out of reach for a voxel-local carver, verified by
+measurement rather than assumed. A per-column interval cannot represent a path
+that revisits an `(x, z)` column at two different heights. Multiple intervals
+per column — which this carver does implement — recovers *some* of that freedom
+(a column can carry a cheese chamber and a noodle tunnel at once) but not
+branching topology. `capsule` is the walked implementation that *can* express
+paths, and it measured worse on every shape metric at 100x the samples
+(57.6% connectivity, 2,826,648 samples) than the voxel-local `tube` it exists to
+be compared against.
 
-- **Noise pillars.** A pillar is stone at a column whose lateral neighbours are
-  air, so it needs neighbour dependence — exactly what makes this design `O(1)`.
-  Measured: 26 of 318,422 stone voxels (0.0082%) have air on all four lateral
-  sides, mean vertical run 2.23 voxels. That is speckle, not pillars, and it is
-  documented as out of reach rather than faked.
-- **Carver caves** (main room plus 1–4 trunks and branches, 85–112 blocks long,
-  branching freely in 3D). A per-column interval cannot represent a path that
-  revisits an `(x, z)` column at two different heights. Multiple intervals per
-  column — which this carver does implement — recovers *some* of that freedom
-  (a column can carry a cheese chamber and a noodle tunnel at once) but not
-  branching topology.
+**Noise pillars** were listed here as unreachable and **are now implemented** as
+an opt-in fourth type (`CaveType::Pillar`, `PILLAR_TAPER`). The earlier reasoning
+— "a pillar needs neighbour dependence, which breaks `O(1)`" — was the wrong
+diagnosis: a pillar needs a narrow `xz` footprint with a *full-height* column,
+and that is reachable without neighbours by re-reading the same level set
+through a sharpened selection gate. See the pillar row in the per-type table
+above (0.5% void, `mean_col` 14.00 against noodle's 2.23).
+
+The honest limit on pillars is **diameter**, not reachability. Gating one field
+selects a thin *curve* near the level set, so measured clusters are 1–4 columns
+across in `xz` — the low end of the wiki's "few blocks in diameter", closer to a
+vertical vein than a chunky pillar. Getting true blobs needs the intersection of
+two fields (`|a| < e1 AND |b| < e2`), which was measured to give a mean cluster
+of 2.94 columns (median 2, p90 6) but costs a third field per corner — 27
+samples per chunk for that type instead of 18. It is not implemented.
 
 One measured design constraint worth knowing before retuning: connectivity
 follows the `xz` footprint overlap, not column height. Raising the noodle radius
