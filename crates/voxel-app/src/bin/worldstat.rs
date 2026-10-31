@@ -63,7 +63,9 @@ fn main() {
 
     let carvers: Vec<(&str, Carver)> = match opts.carver {
         Some(c) => vec![(name_of(c), c)],
-        None => vec![("density", Carver::Density), ("sparse", Carver::Sparse)],
+        // Every carver is behind the enum now, so the default sweep is all of
+        // them rather than a hand-written pair.
+        None => Carver::ALL.iter().map(|&c| (c.name(), c)).collect(),
     };
 
     println!(
@@ -142,10 +144,8 @@ fn row(name: &str, s: &WindowStats, elapsed: std::time::Duration, columns: u64) 
 }
 
 fn name_of(carver: Carver) -> &'static str {
-    match carver {
-        Carver::Density => "density",
-        Carver::Sparse => "sparse",
-    }
+    // One spelling, defined on the enum, so this cannot drift from `.env`.
+    carver.name()
 }
 
 #[derive(Debug, Default)]

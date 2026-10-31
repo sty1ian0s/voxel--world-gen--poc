@@ -16,4 +16,4 @@ mod storage;
 mod stream;
 
 pub use storage::{Chunk, ChunkGrid, VoxelGroup};
-pub use stream::{CarverSpec, Region, VerticalBounds, WorldGen};
+pub use stream::{CarverSpec, Region, VerticalBounds, WorldGen, carve_with};

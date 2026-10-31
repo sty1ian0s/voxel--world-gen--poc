@@ -52,20 +52,58 @@ impl FromStr for Env {
 }
 
 /// Which cave carver Pass 2 runs.
+///
+/// All five carvers in the project, selectable by name through `VOXEL_CARVER`
+/// and switchable at runtime. `Density` and `Sparse` are the two `PROJECT.md`
+/// §4.2 names; `Mc`, `Capsule` and `Tube` were previously reachable only by
+/// calling `mc::carve` / `capsule::carve` / `tube::carve` directly, which meant
+/// `cavestat` could measure them but the app could not run them.
+///
+/// `Density` stays the default: it is what `.env` ships and what the benchmark
+/// baseline assumes. `Tube` is the fastest of the three newer ones and is *not*
+/// the default — it is opt-in by name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Carver {
     /// Pass 2A: full 3D density field, `O(N^3)` noise samples.
     Density,
     /// Pass 2B: deterministic origin lookup + bounded SDF stamp carving, `O(S)`.
     Sparse,
+    /// Minecraft-1.18-style noise caves: cheese, spaghetti and noodle fields.
+    Mc,
+    /// Pass 2C: capsule chains placed by 2D fields, Y by arithmetic.
+    Capsule,
+    /// Multi-node 2D interval tubes: all three MC cave types, no walk.
+    Tube,
+}
+
+impl Carver {
+    /// Every carver, in the order the benchmark and `cavestat` report them.
+    ///
+    /// A flat array rather than an iterator over a range, so adding a variant is
+    /// a compile error at every `match` instead of a silently shorter table.
+    pub const ALL: [Self; 5] = [
+        Self::Density,
+        Self::Sparse,
+        Self::Mc,
+        Self::Capsule,
+        Self::Tube,
+    ];
+
+    /// The canonical `.env` spelling.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Density => "density",
+            Self::Sparse => "sparse",
+            Self::Mc => "mc",
+            Self::Capsule => "capsule",
+            Self::Tube => "tube",
+        }
+    }
 }
 
 impl fmt::Display for Carver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Density => "density",
-            Self::Sparse => "sparse",
-        })
+        f.write_str(self.name())
     }
 }
 
@@ -76,10 +114,13 @@ impl FromStr for Carver {
         match s.trim().to_ascii_lowercase().as_str() {
             "density" | "2a" | "on3" => Ok(Self::Density),
             "sparse" | "2b" | "stamp" => Ok(Self::Sparse),
+            "mc" | "noise" | "1.18" => Ok(Self::Mc),
+            "capsule" | "2c" => Ok(Self::Capsule),
+            "tube" | "tubes" => Ok(Self::Tube),
             other => Err(ConfigError::BadValue {
                 key: "VOXEL_CARVER",
                 value: other.to_owned(),
-                expected: "density | sparse",
+                expected: "density | sparse | mc | capsule | tube",
             }),
         }
     }

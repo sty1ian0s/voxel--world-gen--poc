@@ -33,7 +33,7 @@
 use crate::config::{CaveParams, Carver};
 use crate::domain::ChunkPos;
 use crate::terrain::heightmap::HeightMap;
-use crate::terrain::{self, density, sparse};
+use crate::terrain::{self, capsule, density, mc, sparse, tube};
 use crate::world::Chunk;
 
 /// Everything that changes what a chunk contains.
@@ -172,6 +172,48 @@ impl Region {
     }
 }
 
+/// Runs the named carver over one chunk, in place.
+///
+/// **This is the only place a [`Carver`] is dispatched.** Every consumer that
+/// wants "run the configured carver" — the streamer, the batch path, the app,
+/// `worldstat` — calls this instead of matching for itself, so adding a carver
+/// is one arm here rather than an edit in five files that can silently disagree.
+///
+/// ## Why a `match` and not a function table
+///
+/// Four of the five carvers are `fn(&mut impl CarveTarget, u32) -> u64`, but
+/// [`sparse::carve`] additionally takes `&CaveParams` and returns `StampStats`
+/// rather than a sample count. Forcing them into one signature would mean either
+/// changing sparse's public signature to lie about what it needs, or erasing all
+/// five into `Box<dyn Fn>` — a virtual call per chunk in the one hot path
+/// `PROJECT.md` §2 explicitly forbids it in. The mismatch is real, so it is
+/// absorbed by one arm of a plain `match`, which the compiler turns into a jump
+/// table with no indirection the caller can see.
+///
+/// `spec` carries the seed and cave parameters; the carvers that need only the
+/// seed ignore the rest.
+pub fn carve_with(carver: Carver, chunk: &mut Chunk, spec: &CarverSpec) {
+    match carver {
+        Carver::Density => {
+            density::carve(chunk, spec.seed);
+        }
+        Carver::Mc => {
+            mc::carve(chunk, spec.seed);
+        }
+        Carver::Capsule => {
+            capsule::carve(chunk, spec.seed);
+        }
+        Carver::Tube => {
+            tube::carve(chunk, spec.seed);
+        }
+        // The adapter arm: sparse needs the cave parameters the others do not,
+        // and reports stamp statistics the others do not have.
+        Carver::Sparse => {
+            sparse::carve(chunk, spec.seed, &spec.cave);
+        }
+    }
+}
+
 /// A chunk-at-a-time generator over an unbounded `(x, z)` plane.
 pub struct WorldGen {
     heightmap: HeightMap,
@@ -234,14 +276,7 @@ impl WorldGen {
         // nothing cheaper to do that means the same thing.
         let mut chunk = Chunk::at(pos);
         terrain::generate_surface(&mut chunk, pos, &self.heightmap);
-        match self.spec.carver {
-            Carver::Density => {
-                density::carve(&mut chunk, self.spec.seed);
-            }
-            Carver::Sparse => {
-                sparse::carve(&mut chunk, self.spec.seed, &self.spec.cave);
-            }
-        }
+        carve_with(self.spec.carver, &mut chunk, &self.spec);
         // Last, because carving changes which voxels can see the sky.
         terrain::finish(&mut chunk);
         self.scratch = chunk;

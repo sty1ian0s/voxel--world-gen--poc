@@ -164,18 +164,17 @@ impl CarverSwitch {
         self.current
     }
 
-    /// Requests the other carver.
+    /// Requests the next carver in [`Carver::ALL`], wrapping around.
     ///
-    /// Toggles relative to any *pending* request rather than to the active
-    /// carver, so pressing the key three times before the frame drains the
-    /// request lands on sparse-then-density-then-sparse, matching what the
-    /// player sees on screen rather than collapsing to a single flip.
+    /// Cycles rather than toggling, now that there are five carvers rather than
+    /// two, and cycles relative to any *pending* request rather than to the
+    /// active carver — so pressing the key three times before the frame drains
+    /// the request advances three steps, matching what the player sees on screen
+    /// rather than collapsing to a single flip.
     pub fn toggle(&mut self) {
         let from = self.requested.unwrap_or(self.current);
-        self.requested = Some(match from {
-            Carver::Density => Carver::Sparse,
-            Carver::Sparse => Carver::Density,
-        });
+        let i = Carver::ALL.iter().position(|&c| c == from).unwrap_or(0);
+        self.requested = Some(Carver::ALL[(i + 1) % Carver::ALL.len()]);
     }
 
     /// Requests a specific carver, ignoring a request for the active one.
@@ -343,33 +342,132 @@ mod tests {
     }
 
     #[test]
-    fn carver_toggle_alternates_and_reports_a_change() {
+    fn carver_toggle_cycles_every_carver_and_reports_a_change() {
+        // Cycles rather than toggles now that there are five carvers: from
+        // `Density` the key must walk all of them and come back around, so
+        // `VOXEL_CARVER=tube` is reachable from the keyboard.
         let mut sw = CarverSwitch::new(Carver::Density);
         assert_eq!(sw.current(), Carver::Density);
         assert_eq!(sw.take(), None, "nothing requested yet");
 
-        sw.toggle();
-        assert_eq!(sw.take(), Some(Carver::Sparse));
-        assert_eq!(sw.current(), Carver::Sparse, "current must update");
-        assert_eq!(sw.take(), None, "a request must only be taken once");
-
-        sw.toggle();
-        assert_eq!(sw.take(), Some(Carver::Density));
+        let mut seen = vec![Carver::Density];
+        for _ in 0..Carver::ALL.len() {
+            sw.toggle();
+            let next = sw.take().expect("a toggle must queue a change");
+            sw.current = next;
+            seen.push(next);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Carver::Density,
+                Carver::Sparse,
+                Carver::Mc,
+                Carver::Capsule,
+                Carver::Tube,
+                Carver::Density,
+            ],
+            "the cycle must visit every carver once and wrap"
+        );
     }
 
     #[test]
     fn repeated_toggles_queue_at_most_one_regeneration() {
         // Pressing the key repeatedly before the frame drains the request must
-        // not queue several regenerations: the last state wins, and it is
-        // computed from the pending request so an odd number of presses still
-        // ends on the other carver.
+        // not queue several regenerations: the last state wins, and because the
+        // cycle is computed from the *pending* request, N presses advance N
+        // steps rather than collapsing to one.
         let mut sw = CarverSwitch::new(Carver::Density);
         sw.toggle(); // pending sparse
-        sw.toggle(); // pending density
-        sw.toggle(); // pending sparse again
-        assert_eq!(sw.take(), Some(Carver::Sparse), "three presses = one flip");
+        sw.toggle(); // pending mc
+        sw.toggle(); // pending capsule
+        assert_eq!(
+            sw.take(),
+            Some(Carver::Capsule),
+            "three presses = three steps around the cycle"
+        );
         assert_eq!(sw.take(), None, "only one regeneration may be queued");
-        assert_eq!(sw.current(), Carver::Sparse);
+        assert_eq!(sw.current(), Carver::Capsule);
+    }
+
+    /// The switch must actually change generated terrain, not just which label
+    /// the HUD draws.
+    ///
+    /// This drives the SAME sequence the app's frame loop drives — take the
+    /// pending carver, `set_carver`, `regenerate_all` — through all five
+    /// variants, and asserts the resulting voxels differ. The GPU path cannot be
+    /// executed headlessly on this machine, so the HUD's effect on the world is
+    /// verified here instead of by eye: a cycle that compiled but never reached
+    /// the carver would pass every other test in this file.
+    #[test]
+    fn every_carver_in_the_cycle_changes_the_generated_world() {
+        use crate::stream::StreamWorld;
+        use voxel_core::{CaveParams, ChunkPos};
+
+        let mut world = StreamWorld::new(
+            1337,
+            128,
+            CaveParams {
+                origin_density: 2.0,
+                min_radius: 1.5,
+                max_radius: 4.0,
+            },
+            Carver::Density,
+        );
+        // A band of chunks, not one: the carvers place caves at different
+        // depths, and a single chunk can legitimately be untouched by one of
+        // them. Sampling a column of chunks is what makes the fingerprints
+        // comparable.
+        world.stream_around(ChunkPos::new(0, 3, 0), 0);
+        for cy in 0..6 {
+            world.generate(ChunkPos::new(0, cy, 0));
+        }
+
+        // Fingerprint every resident chunk, sorted by position so generation
+        // order cannot make two identical worlds look different.
+        let fingerprint = |w: &StreamWorld| -> Vec<u16> {
+            let mut positions: Vec<ChunkPos> = w.positions().collect();
+            positions.sort();
+            assert!(positions.len() > 1, "the fixture must load several chunks");
+            positions
+                .iter()
+                .flat_map(|p| w.get(*p).expect("resident").to_packed())
+                .collect()
+        };
+
+        let mut sw = CarverSwitch::new(Carver::Density);
+        let mut seen: Vec<(Carver, Vec<u16>)> = vec![(world.carver(), fingerprint(&world))];
+
+        for _ in 0..Carver::ALL.len() - 1 {
+            sw.toggle();
+            let next = sw.take().expect("a toggle must queue a carver");
+            // Exactly what the frame loop does, in the same order.
+            world.set_carver(next);
+            world.regenerate_all();
+            assert_eq!(world.carver(), next, "set_carver must stick");
+            seen.push((next, fingerprint(&world)));
+        }
+
+        assert_eq!(seen.len(), Carver::ALL.len(), "the cycle must reach all five");
+        for (name, _) in &seen {
+            let hits = seen.iter().filter(|(c, _)| c == name).count();
+            assert_eq!(hits, 1, "{name} appeared {hits} times in one cycle");
+        }
+        for i in 0..seen.len() {
+            for j in (i + 1)..seen.len() {
+                // Compare a digest, not the vectors: a mismatch here is 4096
+                // numbers per chunk and the useful signal is which two carvers
+                // collided.
+                let same = seen[i].1 == seen[j].1;
+                assert!(
+                    !same,
+                    "{:?} and {:?} generated identical terrain across {} chunks;                      at least one of them carved nothing",
+                    seen[i].0,
+                    seen[j].0,
+                    seen[i].1.len() / 4096
+                );
+            }
+        }
     }
 
     #[test]

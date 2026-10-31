@@ -35,11 +35,33 @@ pub struct GenReport {
 impl GenReport {
     /// The work counter that corresponds to the configured carver, so callers
     /// compare like with like.
+    ///
+    /// Only `Density` and `Sparse` have a per-voxel counter; `Mc` counts 2D
+    /// samples internally and `Capsule`/`Tube` expose theirs through their own
+    /// `carve` return value rather than through this report. Returning 0 for
+    /// those is honest: it means "this report does not count that carver's
+    /// work", not "the carver did no work". Do not compare a 0 here against
+    /// another carver's number.
     pub fn carver_work(&self, carver: Carver) -> u64 {
         match carver {
             Carver::Density => self.density_samples,
             Carver::Sparse => self.sparse_voxels_tested,
+            Carver::Mc | Carver::Capsule | Carver::Tube => 0,
         }
+    }
+}
+
+/// The carver spec the batch path generates with.
+///
+/// The batch path's heightmap is fitted to `cfg.world.y * 16`, so the spec is
+/// built from the same number: the streamer and this path must agree on the band
+/// or the parity test between them is comparing two worlds.
+fn spec_of(cfg: &Config) -> crate::world::CarverSpec {
+    crate::world::CarverSpec {
+        seed: cfg.seed,
+        carver: cfg.carver,
+        cave: cfg.cave,
+        world_height: cfg.world.y * 16,
     }
 }
 
@@ -60,6 +82,9 @@ pub fn generate_world(cfg: &Config) -> (ChunkGrid, GenReport) {
         let chunk = grid.get_mut(pos);
         terrain::generate_surface(chunk, pos, &hm);
 
+        // One dispatch, shared with the streamer: `world::stream::carve_with`.
+        // The counters below are only meaningful for the two carvers that have
+        // them, so they are read from a matching arm rather than assumed.
         match cfg.carver {
             Carver::Density => {
                 report.density_samples += density::carve(chunk, cfg.seed);
@@ -68,6 +93,9 @@ pub fn generate_world(cfg: &Config) -> (ChunkGrid, GenReport) {
                 let stats = sparse::carve(chunk, cfg.seed, &cfg.cave);
                 report.sparse_voxels_tested += stats.voxels_tested;
                 report.sparse_regions_visited += stats.regions_visited;
+            }
+            other => {
+                crate::world::carve_with(other, chunk, &spec_of(cfg));
             }
         }
         terrain::finish(chunk);

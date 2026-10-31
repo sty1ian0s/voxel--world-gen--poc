@@ -1,81 +1,42 @@
 //! A streaming world: chunks generated around the camera, not in a fixed box.
 //!
-//! Generation was already position-independent — the heightmap is a pure
-//! function of world coordinates and the sparse carver uses `div_euclid` so
-//! negative regions work — so the only thing that made the world finite was
-//! [`ChunkGrid`] being a dense rectangle. This replaces that with a map keyed by
-//! position, filled in a radius around the camera and evicted behind it, which
-//! is what turns the POC into something you can fly through.
+//! This is a **residency cache**, not a generator. Everything about producing a
+//! chunk — the surface pass, the carver, lighting — lives in
+//! [`voxel_core::world::WorldGen`], which is the implementation
+//! `streaming_matches_the_batch_path_byte_for_byte` proves byte-identical to the
+//! in-RAM path. What stays here is the app-level question the core has no
+//! business answering: *which* chunks are resident right now, and how much
+//! generation that has cost.
 //!
-//! Vertical extent stays bounded. A voxel world with no floor or ceiling is not
-//! useful here, and the heightmap already produces terrain within a band, so
-//! generating the full column would spend time on chunks that are always empty
-//! or always solid.
+//! That split matters. Before it, this file carried a second copy of the
+//! generation pipeline, so it could drift from the core one — and the byte
+//! identity guarantee only covered the copy nobody rendered. Now there is one
+//! pipeline and this file cannot generate a chunk differently from the one the
+//! parity test checks, because it does not generate chunks at all.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
-use voxel_core::terrain::heightmap::HeightMap;
-use voxel_core::terrain::{self, density, sparse};
+use voxel_core::world::{CarverSpec, VerticalBounds, WorldGen};
 use voxel_core::{Carver, CaveParams, Chunk, ChunkPos};
 
-/// How many chunks tall the world is, and where it starts.
+/// Re-exported so callers keep one import for the vertical extent.
 ///
-/// Fixed rather than streamed so the vertical band is known up front: the
-/// mesher and the lighting both need to reason about the world's top, and an
-/// unlimited column would mean generating chunks that are guaranteed empty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerticalBounds {
-    /// Lowest chunk index generated.
-    pub min_y: i32,
-    /// One past the highest chunk index generated.
-    pub max_y: i32,
-}
+/// The definition lives in the core now: the streamer and the app must agree on
+/// what the window is, and two definitions of a band is how they stop agreeing.
+pub use voxel_core::world::VerticalBounds as Bounds;
 
-impl VerticalBounds {
-    /// Enough height for the default terrain band plus sky and depth.
-    ///
-    /// Not `const`: `div_ceil` and `Ord::max` are not yet usable in const
-    /// context, and this runs once at startup anyway.
-    pub fn default_for_world_height(world_height: u32) -> Self {
-        // Plain arithmetic rather than `div_ceil`, which is not stable for
-        // signed integers on this toolchain.
-        let height = world_height as i32;
-        let chunks = (height + 15) / 16;
-        Self {
-            min_y: 0,
-            max_y: if chunks < 1 { 1 } else { chunks },
-        }
-    }
-
-    pub fn contains(&self, y: i32) -> bool {
-        y >= self.min_y && y < self.max_y
-    }
-
-    pub fn len(&self) -> i32 {
-        self.max_y - self.min_y
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() <= 0
-    }
-}
-
-/// Why a chunk could not be generated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
-    /// Outside the world's vertical band.
-    AboveWorld,
-    BelowWorld,
-}
-
-/// The streaming world: generated chunks plus the parameters to make more.
+/// The streaming world: which chunks are resident, plus the counters.
 pub struct StreamWorld {
+    /// Generated chunks, keyed by position. The only world-sized structure in
+    /// the app, and the thing eviction exists to bound.
     chunks: HashMap<ChunkPos, Chunk>,
-    heightmap: HeightMap,
+    /// The one generator. Owns the band, the seed and the carver, so the app
+    /// cannot describe a world the core would generate differently.
+    emit: WorldGen,
+    /// The cave parameters the generator was built with, kept so
+    /// [`Self::cave_params`] can hand out a borrow.
     cave: CaveParams,
-    carver: Carver,
-    seed: u32,
-    bounds: VerticalBounds,
     /// Chunks generated since construction, for the benchmark readout.
     pub chunks_generated: u64,
     /// Total time spent generating, excluding meshing and upload.
@@ -86,29 +47,39 @@ impl StreamWorld {
     pub fn new(seed: u32, world_height: u32, cave: CaveParams, carver: Carver) -> Self {
         Self {
             chunks: HashMap::new(),
-            heightmap: HeightMap::fitted_to_world(seed, world_height),
             cave,
-            carver,
-            seed,
-            bounds: VerticalBounds::default_for_world_height(world_height),
+            emit: WorldGen::new(CarverSpec {
+                seed,
+                carver,
+                cave,
+                world_height,
+            }),
             chunks_generated: 0,
             generate_nanos: 0,
         }
     }
 
     pub fn bounds(&self) -> VerticalBounds {
-        self.bounds
+        self.emit.bounds()
     }
 
     pub fn carver(&self) -> Carver {
-        self.carver
+        self.emit.spec().carver
     }
 
+    /// Changes the carver for subsequent generation.
+    ///
+    /// Does not touch resident chunks; [`Self::regenerate_all`] is what makes the
+    /// change visible on screen.
     pub fn set_carver(&mut self, carver: Carver) {
-        self.carver = carver;
+        let mut spec = self.emit.spec();
+        spec.carver = carver;
+        self.emit = WorldGen::new(spec);
     }
 
     pub fn cave_params(&self) -> &CaveParams {
+        // `CarverSpec` is `Copy`, so `spec()` is a temporary; the cave params
+        // live in a field of their own so this can hand out a borrow.
         &self.cave
     }
 
@@ -140,25 +111,12 @@ impl StreamWorld {
         if self.chunks.contains_key(&pos) {
             return self.chunks.get(&pos);
         }
-        if !self.bounds.contains(pos.y) {
+        if !self.bounds().contains(pos.y) {
             return None;
         }
 
-        let start = std::time::Instant::now();
-        let mut chunk = Chunk::at(pos);
-        terrain::generate_surface(&mut chunk, pos, &self.heightmap);
-        match self.carver {
-            Carver::Density => {
-                density::carve(&mut chunk, self.seed);
-            }
-            Carver::Sparse => {
-                sparse::carve(&mut chunk, self.seed, &self.cave);
-            }
-        }
-        // Lighting last: a carved pocket changes what can see the sky, so
-        // lighting first would leave every cave fully lit.
-        terrain::finish(&mut chunk);
-
+        let start = Instant::now();
+        let chunk = self.emit.chunk_at(pos);
         self.generate_nanos += start.elapsed().as_nanos() as u64;
         self.chunks_generated += 1;
         self.chunks.insert(pos, chunk);
@@ -171,8 +129,11 @@ impl StreamWorld {
     /// sphere you can see the corners of chunks that were never loaded, which
     /// shows up as holes in the terrain at the edge of the view.
     pub fn positions_in_radius(&self, centre: ChunkPos, radius: i32) -> Vec<ChunkPos> {
-        let mut out = Vec::new();
-        for y in self.bounds.min_y..self.bounds.max_y {
+        let bounds = self.bounds();
+        let mut out = Vec::with_capacity(
+            ((2 * radius + 1).max(0) as usize).pow(2) * bounds.len().max(0) as usize,
+        );
+        for y in bounds.min_y..bounds.max_y {
             for dz in -radius..=radius {
                 for dx in -radius..=radius {
                     out.push(ChunkPos::new(centre.x + dx, y, centre.z + dz));
@@ -184,14 +145,15 @@ impl StreamWorld {
 
     /// Generates every missing chunk within `radius` of `centre`.
     ///
-    /// Parallel because each chunk is independent: the carvers write only to
-    /// the chunk they are given, which the bounded-stamp test in the sparse
-    /// module guarantees.
+    /// Parallel because each chunk is independent: a carver writes only to the
+    /// chunk it is given, which the bounded-stamp test in the sparse module
+    /// guarantees. Each worker builds its own [`WorldGen`], since the generator
+    /// reuses one scratch chunk and therefore cannot be shared.
     pub fn stream_around(&mut self, centre: ChunkPos, radius: i32) -> usize {
         use rayon::prelude::*;
 
-        let wanted = self.positions_in_radius(centre, radius);
-        let missing: Vec<ChunkPos> = wanted
+        let missing: Vec<ChunkPos> = self
+            .positions_in_radius(centre, radius)
             .into_iter()
             .filter(|p| !self.chunks.contains_key(p))
             .collect();
@@ -199,23 +161,20 @@ impl StreamWorld {
             return 0;
         }
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
+        let spec = self.emit.spec();
+        // `WorldGen` owns a 12 KiB scratch chunk and is built once per worker.
+        // It is boxed so that 12 KiB lives on the heap rather than being
+        // constructed in the worker closure's stack frame: with several rayon
+        // workers alive at once the unboxed version overflowed the stack in
+        // debug builds, which is a real failure a release build would have
+        // hidden behind a smaller frame.
         let generated: Vec<(ChunkPos, Chunk)> = missing
             .par_iter()
-            .map(|&pos| {
-                let mut chunk = Chunk::at(pos);
-                terrain::generate_surface(&mut chunk, pos, &self.heightmap);
-                match self.carver {
-                    Carver::Density => {
-                        density::carve(&mut chunk, self.seed);
-                    }
-                    Carver::Sparse => {
-                        sparse::carve(&mut chunk, self.seed, &self.cave);
-                    }
-                }
-                terrain::finish(&mut chunk);
-                (pos, chunk)
-            })
+            .map_init(
+                || Box::new(WorldGen::new(spec)),
+                |generator, &pos| (pos, generator.chunk_at(pos)),
+            )
             .collect();
 
         self.generate_nanos += start.elapsed().as_nanos() as u64;
@@ -246,19 +205,9 @@ impl StreamWorld {
     pub fn regenerate_all(&mut self) {
         let positions: Vec<ChunkPos> = self.chunks.keys().copied().collect();
         self.chunks.clear();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for pos in positions {
-            let mut chunk = Chunk::at(pos);
-            terrain::generate_surface(&mut chunk, pos, &self.heightmap);
-            match self.carver {
-                Carver::Density => {
-                    density::carve(&mut chunk, self.seed);
-                }
-                Carver::Sparse => {
-                    sparse::carve(&mut chunk, self.seed, &self.cave);
-                }
-            }
-            terrain::finish(&mut chunk);
+            let chunk = self.emit.chunk_at(pos);
             self.chunks.insert(pos, chunk);
         }
         self.generate_nanos += start.elapsed().as_nanos() as u64;
