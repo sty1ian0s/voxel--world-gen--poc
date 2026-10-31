@@ -93,6 +93,59 @@ known to be an even smaller share of the total than the old numbers implied.
 
 ## Latency distribution (p50/p90/p99/p99.9)
 
+### Latency by percentile, all five carvers (2026-10-31)
+
+The section below covers `density` and `sparse` only, because that was the
+comparison the project started from. The carvers the 2D strategy is actually
+judged on — `mc` and `tube` — **had no measured percentiles at all** until
+`benches/latency.rs` was generalised to a carver slice. They do now, and the
+harness also had a band bug worth recording.
+
+**The band bug.** `latency.rs` pinned `CY = 1`, i.e. world y 16..31. That was
+correct when caves were placed relative to a 64-voxel box; after cave placement
+went absolute the band moved to y 40..88, so the benchmark was timing the
+carvers on **chunks containing no caves**. Every carver here skips voxels that
+are already air, so those samples measured the noise and arithmetic and never
+the carve writes. The band is now derived from `measured_band_chunks()` and an
+assertion fails if the sampled band carves nothing — the check whose absence
+let this go unnoticed.
+
+Per-chunk carve latency, microseconds, 5000 samples, seed 1337, setup
+(surface generation) excluded:
+
+| metric | density | sparse | mc | capsule | **tube** | tube vs mc |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| min | 16.82 | 96.57 | 60.57 | 241.65 | **8.35** | 7.3x |
+| p50 | 139.41 | 137.04 | 366.80 | 329.65 | **13.92** | **26.4x** |
+| p90 | 196.42 | 201.07 | 467.05 | 415.86 | **17.08** | **27.4x** |
+| p99 | 251.29 | 249.79 | 639.34 | 487.48 | **27.91** | **22.9x** |
+| p99.9 | 361.79 | 355.03 | 878.51 | 972.46 | **54.20** | **16.2x** |
+| mean | 114.98 | 150.76 | 306.29 | 339.49 | **13.76** | 22.3x |
+| max | 1891.13 | 9144.53 | 4404.39 | 8660.34 | **83.31** | 52.9x |
+
+Tail against own median (the number a frame budget cares about):
+
+| carver | p90/p50 | p99/p50 | p99.9/p50 | worst chunk |
+| --- | ---: | ---: | ---: | ---: |
+| density | 1.41x | 1.80x | 2.60x | 1.89 ms |
+| sparse | 1.47x | 1.82x | 2.59x | 9.14 ms |
+| mc | 1.27x | 1.74x | 2.40x | 4.40 ms |
+| capsule | 1.26x | 1.48x | 2.95x | 8.66 ms |
+| tube | 1.23x | 2.01x | 3.89x | 0.08 ms |
+
+**`tube` wins at every percentile and the win holds into the tail** — 26.4x at
+p50, still 16.2x at p99.9. Its tail/median is the widest (3.89x at p99.9)
+because its absolute times are so small that fixed per-chunk overheads dominate
+the spread; in absolute terms its worst chunk in 5000 is **0.08 ms** against
+mc's 4.40 ms.
+
+**The sample ratio is not the latency ratio, and the difference matters.** `tube`
+takes 154x fewer *noise samples* than `mc` (27,648 vs 4,250,880) but is only
+26x faster in wall-clock per chunk. `mc` skips voxels that are already air, so
+its real work is far below "one sample per voxel" — the 154x figure is a sample
+count, and quoting it as a speedup would be the same category of error as the
+old "130x" claim this document already corrects.
+
 Criterion reports a median and a confidence interval; it has no notion of the
 tail. World generation runs inside a frame, so the tail is what drops frames.
 `benches/latency.rs` measures 5000 single-chunk carves per carver, setup
@@ -184,6 +237,40 @@ Peak RSS is **identical (8.57 MB)** - both carvers allocate the same chunk grid,
 and neither allocates meaningfully per-carve. Memory is not a differentiator;
 the sparse carver's origin enumeration reuses stack and a bounded region scan
 rather than building a per-chunk list.
+
+### Resource usage, all five carvers (2026-10-31)
+
+`carver_bench` is hardcoded to the original `density`/`sparse` pair, so the
+resource figures for the other three were taken with `/usr/bin/time -v` around
+`worldstat --side 128 --rows 8 --carver <name>`:
+
+| carver | wall | user CPU | peak RSS |
+| --- | ---: | ---: | ---: |
+| **tube** | **31.25 s** | 31.24 s | 5,200 kB |
+| sparse | 43.65 s | 43.64 s | 5,180 kB |
+| capsule | 54.64 s | 54.63 s | 5,308 kB |
+| density | 56.78 s | 56.74 s | 5,252 kB |
+| mc | 143.26 s | 143.26 s | 5,216 kB |
+
+**Peak RSS is flat across all five (5,180-5,308 kB, a 2.4% spread).** Every
+carver is chunk-local with no world-sized allocation, so memory is not a
+differentiator between strategies; the 128 kB spread is the residency
+structures, not the carver.
+
+**Wall time is not carver time, and this table must not be read as if it were.**
+`tube` is 26x faster than `mc` at carve-only latency (13.92 us vs 366.80 us p50)
+but only 4.6x faster here (31.25 s vs 143.26 s), because `worldstat` also runs
+`generate_surface` per chunk and a union-find over the window to compute
+connectivity and component counts. That shared work is identical for every
+carver and is a large fraction of the total, so it compresses every ratio toward
+1. **The `p50` table above is the per-carver number; this table is the
+pipeline.**
+
+That `tube` finishes *faster than `density`* here, while doing 2.5x the carve
+cost per chunk of `sparse`, is the same conclusion the end-to-end table further
+up reaches: at these settings the pipeline is dominated by surface generation
+and measurement, not carving. It is why the headline comparison is per-chunk
+latency rather than wall clock.
 
 Hardware counters, three consecutive runs at side 8 (stable to ±0.3%):
 
